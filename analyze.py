@@ -17,20 +17,23 @@ def analyze(data):
 
     ci = stats.t.interval(0.95, df=n-1, loc=mean, scale=std/np.sqrt(n))
 
+    max1 = data.max()
+    min1 = data.min()
+
     lower = mean - 3*std
     upper = mean + 3*std
     outliers = data[(data < lower) | (data > upper)]
 
-    return mean, std, ci, outliers
+    return mean, std, ci, max1, min1, outliers
 
-def save_to_excel(data, clean, mean, std, ci, outliers,
-                  mean2, std2, ci2,
+def save_to_excel(data, clean, mean, std, ci, max1, min1,  outliers,
+                  mean2, std2, ci2, max2, min2,
                   img1_buffer, img2_buffer, filename):
 
     result_df = pd.DataFrame({
-        "項目": ["平均", "標準偏差", "データ数", "CI下限", "CI上限", "外れ値数"],
-        "全データ": [mean, std, len(data), ci[0], ci[1], len(outliers)],
-        "外れ値除外後": [mean2, std2, len(clean), ci2[0], ci2[1], 0]
+        "項目": ["平均", "標準偏差", "データ数", "Max", "Min", "CI下限", "CI上限", "外れ値数"],
+        "全データ": [mean, std, len(data), max1, min1,  ci[0], ci[1], len(outliers)],
+        "外れ値除外後": [mean2, std2, len(clean), max2, min2, ci2[0], ci2[1], 0]
     })
 
     if len(outliers) > 0:
@@ -69,13 +72,15 @@ def run():
         data = df["測定値(g)"].dropna()
 
         # 全データ分析
-        mean, std, ci, outliers = analyze(data)
+        mean, std, ci, max1, min1, outliers = analyze(data)
 
         result = f"""
 【全データ】
 平均: {mean:.3f}
 σ: {std:.3f}
 データ数: {len(data)}
+Max: {max1:.3f}
+Min: {min1:.3f}
 
 95%信頼区間:
 {ci[0]:.3f} ～ {ci[1]:.3f}
@@ -104,13 +109,15 @@ def run():
         # 外れ値除外
         clean = data[~data.isin(outliers)]
 
-        mean2, std2, ci2, _ = analyze(clean)
+        mean2, std2, ci2, max2, min2, _ = analyze(clean)
 
         result2 = f"""
 【外れ値除外後】
 平均: {mean2:.3f}
 σ: {std2:.3f}
 データ数: {len(clean)}
+Max: {max2:.3f}
+Min: {min2:.3f}
 
 95%信頼区間:
 {ci2[0]:.3f} ～ {ci2[1]:.3f}
@@ -137,8 +144,8 @@ def run():
                 initialfile=f"分析結果_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
             )
 
-            save_to_excel(data, clean, mean, std, ci, outliers,
-                          mean2, std2, ci2,
+            save_to_excel(data, clean, mean, std, ci, max1, min1,  outliers,
+                          mean2, std2, ci2, max2, min2,
                           img1_buffer, img2_buffer, filename)
 
             messagebox.showinfo("完了", "Excel保存完了！")
