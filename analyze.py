@@ -63,7 +63,10 @@ def run():
         if not filename:
             return
 
-        df = pd.read_csv(file, encoding="cp932")
+        try:
+           df = pd.read_csv(file, encoding="cp932")
+        except:
+           df = pd.read_csv(file, encoding="utf-8-sig")
 
         # 前処理
         df.columns = df.columns.str.replace("　", "").str.strip()
