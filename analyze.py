@@ -19,14 +19,9 @@ def analyze(data):
     max1 = data.max()
     min1 = data.min()
 
-    # IQR法（調整可能）
-    q1 = data.quantile(0.25)
-    q3 = data.quantile(0.75)
-    iqr = q3 - q1
-
-    k = 3.5
-    lower = q1 - k * iqr
-    upper = q3 + k * iqr
+    # ±3σ
+    lower = mean - 3 * std
+    upper = mean + 3 * std
 
     outliers = data[(data < lower) | (data > upper)]
 
@@ -36,7 +31,7 @@ def save_to_excel(data, mean, std, ci, max1, min1, lower, upper,
                   outliers, img_buffer, rank_counts, filename):
 
     result_df = pd.DataFrame({
-        "項目": ["平均", "標準偏差", "データ数", "Max", "Min", "下限", "上限"],
+        "項目": ["平均", "標準偏差", "データ数", "Max", "Min", "下限(-3σ)", "上限(+3σ)"],
         "値": [mean, std, len(data), max1, min1, lower, upper]
     })
 
@@ -109,8 +104,8 @@ Min: {min1:.3f}
         plt.hist(data, bins=30, alpha=0.7)
 
         plt.axvline(mean, label="平均")
-        plt.axvline(lower, linestyle="--", label="IQR下限")
-        plt.axvline(upper, linestyle="--", label="IQR上限")
+        plt.axvline(lower, linestyle="--", label="-3σ")
+        plt.axvline(upper, linestyle="--", label="+3σ")
 
         plt.title("重量分布（OKデータ）")
         plt.legend()
@@ -143,7 +138,7 @@ Min: {min1:.3f}
 
 # GUI
 root = tk.Tk()
-root.title("重量分析ツール（IQR＋ランク対応）")
+root.title("重量分析ツール（3σ版）")
 
 btn = tk.Button(root, text="CSV選択して解析", command=run, height=2, width=30)
 btn.pack(pady=20)
