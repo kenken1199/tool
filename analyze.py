@@ -28,6 +28,12 @@ def analyze(data):
 def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                   outliers_df, img_buffer, rank_counts, filename):
 
+    from openpyxl.styles import PatternFill
+
+    red_fill = PatternFill(start_color="FFFF0000",
+                           end_color="FFFF0000",
+                           fill_type="solid")
+
     result_df = pd.DataFrame({
         "項目": ["平均", "標準偏差", "データ数", "Max", "Min", "下限(-3σ)", "上限(+3σ)"],
         "値": [mean, std, len(df_ok), max1, min1, lower, upper]
@@ -46,9 +52,9 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
 
         rank_counts.to_excel(writer, sheet_name="ランクコード集計", index=False)
 
-        # === フィルター追加 ===
         workbook = writer.book
 
+        # ===== フィルター =====
         ws_ok = workbook["OKデータ"]
         ws_out = workbook["外れ値"]
 
@@ -58,7 +64,17 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
         ws_ok.auto_filter.ref = f"A1:C{ok_rows}"
         ws_out.auto_filter.ref = f"A1:C{out_rows}"
 
-        # === グラフ ===
+        # ===== 行ごと赤（ここが今回の本命）=====
+        outlier_ids = set(outliers_df["測定値出力No."].values)
+
+        for row in ws_ok.iter_rows(min_row=2, max_row=ok_rows):
+            row_id = row[0].value  # A列（No）
+            if row_id in outlier_ids:
+                for cell in row:
+                    cell.fill = red_fill
+        # ======================================
+
+        # ===== グラフ =====
         from openpyxl.drawing.image import Image
         sheet = workbook.create_sheet("グラフ")
         sheet.add_image(Image(img_buffer), "A1")
@@ -77,7 +93,7 @@ def process_lot(group, lot, save_dir, rank_counts):
 
     outliers_df = df_ok[(data < lower) | (data > upper)]
 
-    # グラフ
+    # ===== グラフ =====
     plt.figure()
     plt.hist(data, bins=30, alpha=0.7)
     plt.axvline(mean, label="平均")
@@ -121,7 +137,7 @@ def run():
         df["測定値(g)"] = pd.to_numeric(df["測定値(g)"], errors="coerce")
         df["日付時刻"] = pd.to_datetime(df["日付時刻"], errors="coerce")
 
-        # ===== ロット選択 =====
+        # ===== ロット判定 =====
         use_split = messagebox.askyesno(
             "ロット判定",
             "時間差30分以上でロット分割しますか？\n（いいえ→1ロット）"
@@ -130,31 +146,29 @@ def run():
         if use_split:
             df = df.sort_values("日付時刻")
             df["時間差(分)"] = df["日付時刻"].diff().dt.total_seconds() / 60
-            threshold = 30
-            df["ロット"] = (df["時間差(分)"] > threshold).cumsum() + 1
+            df["ロット"] = (df["時間差(分)"] > 30).cumsum() + 1
         else:
             df["ロット"] = 1
 
         lot_count = df["ロット"].nunique()
 
-        # ランクコード集計
+        # ===== ランクコード集計 =====
         rank_map = {"2": "OK", "1": "軽量", "E": "過量", "0": "２個乗り"}
         rank_counts = df["ランクコード"].value_counts().reset_index()
         rank_counts.columns = ["ランクコード", "件数"]
         rank_counts["内容"] = rank_counts["ランクコード"].map(rank_map)
+        rank_counts = rank_counts[["ランクコード", "内容", "件数"]]
 
         # ===== 分岐 =====
         if lot_count == 1:
             process_lot(df, 1, save_dir, rank_counts)
-
         else:
             ok = messagebox.askyesno(
                 "確認",
                 f"{lot_count}ロット検出されました。\nこのままでよろしいですか？"
             )
-
             if not ok:
-                messagebox.showwarning("中止", "CSVをロットごとに分割してください")
+                messagebox.showwarning("中止", "CSVを分割してください")
                 return
 
             for lot, group in df.groupby("ロット"):
@@ -167,7 +181,7 @@ def run():
 
 # GUI
 root = tk.Tk()
-root.title("重量分析ツール（完成版）")
+root.title("重量分析ツール（最終完成版）")
 
 btn = tk.Button(root, text="CSV選択して解析", command=run, height=2, width=30)
 btn.pack(pady=20)
