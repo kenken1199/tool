@@ -25,10 +25,12 @@ def analyze(data):
 
     return mean, std, ci, max1, min1, lower, upper
 
+
 def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                   outliers_df, img_buffer, rank_counts, filename):
 
     from openpyxl.styles import PatternFill
+    from openpyxl.drawing.image import Image
 
     red_fill = PatternFill(start_color="FFFF0000",
                            end_color="FFFF0000",
@@ -41,7 +43,7 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
 
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
 
-        # === 書き込み ===
+        # ===== 書き込み =====
         result_df.to_excel(writer, sheet_name="統計結果", index=False)
 
         df_ok[["測定値出力No.", "日付時刻", "測定値(g)"]] \
@@ -64,23 +66,31 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
         ws_ok.auto_filter.ref = f"A1:C{ok_rows}"
         ws_out.auto_filter.ref = f"A1:C{out_rows}"
 
-        # ===== 行ごと赤（ここが今回の本命）=====
+        # ===== 行ごと赤（OKデータ内の外れ値）=====
         outlier_ids = set(outliers_df["測定値出力No."].values)
 
         for row in ws_ok.iter_rows(min_row=2, max_row=ok_rows):
-            row_id = row[0].value  # A列（No）
+            row_id = row[0].value
             if row_id in outlier_ids:
                 for cell in row:
                     cell.fill = red_fill
-        # ======================================
 
         # ===== グラフ =====
-        from openpyxl.drawing.image import Image
         sheet = workbook.create_sheet("グラフ")
         sheet.add_image(Image(img_buffer), "A1")
 
-def process_lot(group, lot, save_dir, rank_counts):
 
+def process_lot(group, lot, save_dir):
+
+    # ===== ランクコード集計（ロット単位）=====
+    rank_map = {"2": "OK", "1": "軽量", "E": "過量", "0": "２個乗り"}
+
+    rank_counts = group["ランクコード"].value_counts().reset_index()
+    rank_counts.columns = ["ランクコード", "件数"]
+    rank_counts["内容"] = rank_counts["ランクコード"].map(rank_map)
+    rank_counts = rank_counts[["ランクコード", "内容", "件数"]]
+
+    # ===== OKデータ抽出 =====
     df_ok = group[group["ランクコード"] == "2"].copy()
     df_ok = df_ok.dropna(subset=["測定値(g)"])
 
@@ -89,8 +99,10 @@ def process_lot(group, lot, save_dir, rank_counts):
 
     data = df_ok["測定値(g)"]
 
+    # ===== 分析 =====
     mean, std, ci, max1, min1, lower, upper = analyze(data)
 
+    # ===== 外れ値 =====
     outliers_df = df_ok[(data < lower) | (data > upper)]
 
     # ===== グラフ =====
@@ -108,6 +120,7 @@ def process_lot(group, lot, save_dir, rank_counts):
     img_buffer.seek(0)
     plt.close()
 
+    # ===== 保存 =====
     filename = os.path.join(
         save_dir,
         f"分析結果_ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
@@ -117,6 +130,7 @@ def process_lot(group, lot, save_dir, rank_counts):
                   lower, upper, outliers_df,
                   img_buffer, rank_counts, filename)
 
+
 def run():
     try:
         file = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
@@ -125,13 +139,13 @@ def run():
 
         save_dir = os.path.dirname(file)
 
-        # CSV読み込み
+        # ===== CSV読み込み =====
         try:
             df = pd.read_csv(file, encoding="cp932")
         except:
             df = pd.read_csv(file, encoding="utf-8-sig")
 
-        # 前処理
+        # ===== 前処理 =====
         df.columns = df.columns.str.replace("　", "").str.strip()
         df["ランクコード"] = df["ランクコード"].astype(str).str.strip()
         df["測定値(g)"] = pd.to_numeric(df["測定値(g)"], errors="coerce")
@@ -152,16 +166,9 @@ def run():
 
         lot_count = df["ロット"].nunique()
 
-        # ===== ランクコード集計 =====
-        rank_map = {"2": "OK", "1": "軽量", "E": "過量", "0": "２個乗り"}
-        rank_counts = df["ランクコード"].value_counts().reset_index()
-        rank_counts.columns = ["ランクコード", "件数"]
-        rank_counts["内容"] = rank_counts["ランクコード"].map(rank_map)
-        rank_counts = rank_counts[["ランクコード", "内容", "件数"]]
-
         # ===== 分岐 =====
         if lot_count == 1:
-            process_lot(df, 1, save_dir, rank_counts)
+            process_lot(df, 1, save_dir)
         else:
             ok = messagebox.askyesno(
                 "確認",
@@ -172,14 +179,15 @@ def run():
                 return
 
             for lot, group in df.groupby("ロット"):
-                process_lot(group, lot, save_dir, rank_counts)
+                process_lot(group, lot, save_dir)
 
         messagebox.showinfo("完了", "Excelファイル作成完了")
 
     except Exception as e:
         messagebox.showerror("エラー", str(e))
 
-# GUI
+
+# ===== GUI =====
 root = tk.Tk()
 root.title("重量分析ツール（最終完成版）")
 
