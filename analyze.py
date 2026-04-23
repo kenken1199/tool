@@ -34,6 +34,8 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
     })
 
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+
+        # === 書き込み ===
         result_df.to_excel(writer, sheet_name="統計結果", index=False)
 
         df_ok[["測定値出力No.", "日付時刻", "測定値(g)"]] \
@@ -44,11 +46,25 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
 
         rank_counts.to_excel(writer, sheet_name="ランクコード集計", index=False)
 
+        # === フィルター追加 ===
+        workbook = writer.book
+
+        ws_ok = workbook["OKデータ"]
+        ws_out = workbook["外れ値"]
+
+        ok_rows = len(df_ok) + 1
+        out_rows = len(outliers_df) + 1
+
+        ws_ok.auto_filter.ref = f"A1:C{ok_rows}"
+        ws_out.auto_filter.ref = f"A1:C{out_rows}"
+
+        # === グラフ ===
         from openpyxl.drawing.image import Image
-        sheet = writer.book.create_sheet("グラフ")
+        sheet = workbook.create_sheet("グラフ")
         sheet.add_image(Image(img_buffer), "A1")
 
 def process_lot(group, lot, save_dir, rank_counts):
+
     df_ok = group[group["ランクコード"] == "2"].copy()
     df_ok = df_ok.dropna(subset=["測定値(g)"])
 
@@ -58,15 +74,17 @@ def process_lot(group, lot, save_dir, rank_counts):
     data = df_ok["測定値(g)"]
 
     mean, std, ci, max1, min1, lower, upper = analyze(data)
+
     outliers_df = df_ok[(data < lower) | (data > upper)]
 
     # グラフ
     plt.figure()
     plt.hist(data, bins=30, alpha=0.7)
-    plt.axvline(mean)
-    plt.axvline(lower, linestyle="--")
-    plt.axvline(upper, linestyle="--")
+    plt.axvline(mean, label="平均")
+    plt.axvline(lower, linestyle="--", label="-3σ")
+    plt.axvline(upper, linestyle="--", label="+3σ")
     plt.title(f"重量分布（ロット{lot}）")
+    plt.legend()
     plt.grid(True)
 
     img_buffer = BytesIO()
@@ -103,21 +121,19 @@ def run():
         df["測定値(g)"] = pd.to_numeric(df["測定値(g)"], errors="coerce")
         df["日付時刻"] = pd.to_datetime(df["日付時刻"], errors="coerce")
 
-        # ===== ロット処理選択 =====
+        # ===== ロット選択 =====
         use_split = messagebox.askyesno(
             "ロット判定",
-            "時間差30分以上でロット分割しますか？\n（いいえ→1ロットとして処理）"
+            "時間差30分以上でロット分割しますか？\n（いいえ→1ロット）"
         )
 
         if use_split:
             df = df.sort_values("日付時刻")
             df["時間差(分)"] = df["日付時刻"].diff().dt.total_seconds() / 60
-
             threshold = 30
             df["ロット"] = (df["時間差(分)"] > threshold).cumsum() + 1
         else:
             df["ロット"] = 1
-        # ========================
 
         lot_count = df["ロット"].nunique()
 
@@ -151,7 +167,7 @@ def run():
 
 # GUI
 root = tk.Tk()
-root.title("重量分析ツール（最終完成版）")
+root.title("重量分析ツール（完成版）")
 
 btn = tk.Button(root, text="CSV選択して解析", command=run, height=2, width=30)
 btn.pack(pady=20)
