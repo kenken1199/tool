@@ -50,7 +50,6 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
 
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
 
-        # ===== 書き込み =====
         result_df.to_excel(writer, sheet_name="統計結果", startrow=2, index=False)
         df_ok[["測定値出力No.", "日付時刻", "測定値(g)"]].to_excel(writer, sheet_name="OKデータ", index=False)
         outliers_df[["測定値出力No.", "日付時刻", "測定値(g)"]].to_excel(writer, sheet_name="外れ値", index=False)
@@ -58,9 +57,7 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
 
         wb = writer.book
 
-        # =========================
-        # ■ 統計結果シート
-        # =========================
+        # ===== 統計結果 =====
         ws = wb["統計結果"]
 
         ws["A1"] = f"重量分析結果（ロット{lot}）"
@@ -69,51 +66,41 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
         ws["D1"] = "作成日時"
         ws["D2"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-        # 見出し
         for cell in ws[3]:
             cell.font = bold
 
-        # 列幅
         ws.column_dimensions["A"].width = 20
         ws.column_dimensions["B"].width = 20
 
-        # フォーマット制御
         for i, row in enumerate(ws.iter_rows(min_row=4, max_row=10, min_col=2, max_col=2), start=0):
             for cell in row:
-                if i == 1:  # 標準偏差
+                if i == 1:
                     cell.number_format = "0.000"
-                elif i == 2:  # データ数
+                elif i == 2:
                     cell.number_format = "0"
                 else:
                     cell.number_format = "0.0"
 
-        # 枠線
         for row in ws.iter_rows(min_row=3, max_row=10, min_col=1, max_col=2):
             for cell in row:
                 cell.border = border
 
-        # =========================
-        # ■ OKデータ・外れ値
-        # =========================
+        # ===== OK / 外れ値 =====
         ws_ok = wb["OKデータ"]
         ws_out = wb["外れ値"]
 
         for sheet in [ws_ok, ws_out]:
-            # 列幅
             sheet.column_dimensions["A"].width = 18
             sheet.column_dimensions["B"].width = 22
             sheet.column_dimensions["C"].width = 15
 
-            # 日付フォーマット
             for row in sheet.iter_rows(min_row=2, min_col=2, max_col=2):
                 for cell in row:
                     cell.number_format = "yyyy-mm-dd hh:mm:ss"
 
-            # フィルター
-            max_row = sheet.max_row
-            sheet.auto_filter.ref = f"A1:C{max_row}"
+            sheet.auto_filter.ref = f"A1:C{sheet.max_row}"
 
-        # 外れ値行を赤
+        # 外れ値をOKシートで赤
         outlier_ids = set(outliers_df["測定値出力No."].values)
 
         for row in ws_ok.iter_rows(min_row=2, max_row=ws_ok.max_row):
@@ -121,28 +108,22 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                 for cell in row:
                     cell.fill = red_fill
 
-        # =========================
-        # ■ ランクコード集計
-        # =========================
+        # ===== ランクコード =====
         ws_rank = wb["ランクコード集計"]
 
         ws_rank.column_dimensions["A"].width = 15
         ws_rank.column_dimensions["B"].width = 20
         ws_rank.column_dimensions["C"].width = 10
 
-        # 見出し太字＆中央寄せ
         for cell in ws_rank[1]:
             cell.font = bold
             cell.alignment = Alignment(horizontal="center")
 
-        # 枠線
         for row in ws_rank.iter_rows(min_row=1, max_row=ws_rank.max_row, min_col=1, max_col=3):
             for cell in row:
                 cell.border = border
 
-        # =========================
-        # ■ グラフ
-        # =========================
+        # ===== グラフ =====
         ws_graph = wb.create_sheet("グラフ")
         ws_graph.add_image(Image(img_buffer), "A1")
 
@@ -207,6 +188,7 @@ def run():
         df["測定値(g)"] = pd.to_numeric(df["測定値(g)"], errors="coerce")
         df["日付時刻"] = pd.to_datetime(df["日付時刻"], errors="coerce")
 
+        # ===== ロット判定 =====
         use_split = messagebox.askyesno("ロット判定", "時間差30分以上でロット分割しますか？")
 
         if use_split:
@@ -216,6 +198,23 @@ def run():
         else:
             df["ロット"] = 1
 
+        # ===== ロット確認（復活）=====
+        lot_count = df["ロット"].nunique()
+
+        if lot_count > 1:
+            ok = messagebox.askyesno(
+                "確認",
+                f"{lot_count}ロット検出されました。\nこの分割でよろしいですか？"
+            )
+
+            if not ok:
+                messagebox.showwarning(
+                    "中止",
+                    "CSVを手動で分割してください。処理を終了します。"
+                )
+                return
+
+        # ===== 実行 =====
         for lot, group in df.groupby("ロット"):
             process_lot(group, lot, save_dir)
 
@@ -226,7 +225,7 @@ def run():
 
 
 root = tk.Tk()
-root.title("重量分析ツール（完成版）")
+root.title("重量分析ツール（最終完成版）")
 
 btn = tk.Button(root, text="CSV選択して解析", command=run, height=2, width=30)
 btn.pack(pady=20)
