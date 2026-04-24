@@ -7,8 +7,13 @@ from tkinter import filedialog, messagebox
 import datetime
 from io import BytesIO
 import os
+import sys
 
 plt.rcParams["font.family"] = "MS Gothic"
+
+# グローバル変数
+app_root = None
+csv_file_to_process = None
 
 # =========================
 # ■ CSV正規化【最終修正版】
@@ -322,12 +327,15 @@ def process_lot(group, lot, save_dir):
 
 
 # =========================
-# ■ メイン
+# ■ ファイル処理（共通部分）
 # =========================
-def run():
+def process_file(file):
+    """
+    CSVファイルを処理する共通関数
+    """
     try:
-        file = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
-        if not file:
+        if not file or not os.path.exists(file):
+            messagebox.showerror("エラー", "ファイルが見つかりません")
             return
 
         save_dir = os.path.dirname(file)
@@ -361,12 +369,35 @@ def run():
 
 
 # =========================
-# ■ GUI
+# ■ メイン関数
 # =========================
-root = tk.Tk()
-root.title("重量分析ツール（完全最終版）")
+def run():
+    """ボタンクリック時のCSV選択処理"""
+    file = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+    if file:
+        process_file(file)
 
-btn = tk.Button(root, text="CSV選択して解析", command=run, height=2, width=30)
+
+def on_closing():
+    """ウィンドウを閉じる処理"""
+    if app_root:
+        app_root.destroy()
+
+
+# =========================
+# ■ GUI初期化
+# =========================
+app_root = tk.Tk()
+app_root.title("重量分析ツール（完全最終版）")
+app_root.protocol("WM_DELETE_WINDOW", on_closing)
+
+btn = tk.Button(app_root, text="CSV選択して解析", command=run, height=2, width=30)
 btn.pack(pady=20)
 
-root.mainloop()
+# ★【新機能】コマンドライン引数でCSVが渡されたら自動処理
+if len(sys.argv) > 1:
+    csv_file_to_process = sys.argv[1]
+    # ウィンドウが完全に表示されてからファイル処理を実行
+    app_root.after(500, lambda: process_file(csv_file_to_process))
+
+app_root.mainloop()
