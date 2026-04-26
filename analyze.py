@@ -1,163 +1,501 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import numpy as np
 from scipy import stats
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox
 import datetime
 from io import BytesIO
+import os
+import sys
 
-# 日本語フォント
 plt.rcParams["font.family"] = "MS Gothic"
 
+app_root = None
+csv_file_to_process = None
+
+
+# =========================
+# ■ ロットプレビューダイアログ
+# =========================
+class LotPreviewDialog(tk.Toplevel):
+
+    def __init__(self, parent, df):
+        super().__init__(parent)
+        self.title("ロット分割プレビュー")
+        self.result = None
+        self.df = df.copy()
+        self.resizable(True, True)
+        self.grab_set()
+
+        # --- しきい値入力 ---
+        frame_top = ttk.Frame(self, padding=10)
+        frame_top.pack(fill="x")
+
+        ttk.Label(frame_top, text="分割しきい値（分）:").pack(side="left")
+        self.threshold_var = tk.IntVar(value=30)
+        ttk.Spinbox(
+            frame_top, from_=1, to=480,
+            textvariable=self.threshold_var, width=6
+        ).pack(side="left", padx=5)
+        ttk.Button(frame_top, text="更新", command=self._update_preview).pack(side="left", padx=5)
+
+        self.lot_label_var = tk.StringVar()
+        ttk.Label(frame_top, textvariable=self.lot_label_var, foreground="navy").pack(side="left", padx=15)
+
+        # --- Treeview ---
+        frame_tree = ttk.Frame(self, padding=10)
+        frame_tree.pack(fill="both", expand=True)
+
+        cols = ("ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数")
+        self.tree = ttk.Treeview(frame_tree, columns=cols, show="headings", height=10)
+        col_widths = {"ロット": 70, "開始時刻": 150, "終了時刻": 150, "総件数": 80, "OKデータ件数": 110}
+        for col in cols:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, anchor="center", width=col_widths[col])
+
+        scrollbar = ttk.Scrollbar(frame_tree, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # --- ボタン ---
+        frame_btn = ttk.Frame(self, padding=(10, 5, 10, 10))
+        frame_btn.pack(fill="x")
+        ttk.Button(frame_btn, text="この分割でOK", command=self._on_ok).pack(side="left", padx=5)
+        ttk.Button(frame_btn, text="ロット分割しない", command=self._on_no_split).pack(side="left", padx=5)
+        ttk.Button(frame_btn, text="手動分割する", command=self._on_manual).pack(side="left", padx=5)
+        ttk.Button(frame_btn, text="キャンセル", command=self._on_cancel).pack(side="right", padx=5)
+
+        self._update_preview()
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def _compute_lots(self, threshold_min):
+        df = self.df.sort_values("日付時刻").copy()
+        df["時間差(分)"] = df["日付時刻"].diff().dt.total_seconds() / 60
+        df["ロット"] = (df["時間差(分)"] > threshold_min).cumsum() + 1
+        return df
+
+    def _update_preview(self):
+        threshold = self.threshold_var.get()
+        df = self._compute_lots(threshold)
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        lot_count = df["ロット"].nunique()
+        self.lot_label_var.set(f"→ {lot_count} ロット検出")
+
+        for lot, group in df.groupby("ロット"):
+            start = group["日付時刻"].min()
+            end = group["日付時刻"].max()
+            total = len(group)
+            ok_count = int((group["ランクコード"] == "2").sum())
+            self.tree.insert("", "end", values=(
+                f"ロット{lot}",
+                start.strftime("%Y-%m-%d %H:%M") if pd.notna(start) else "-",
+                end.strftime("%Y-%m-%d %H:%M") if pd.notna(end) else "-",
+                total,
+                ok_count,
+            ))
+
+        self._df_with_lots = df
+
+    def _on_ok(self):
+        self.result = ("ok", self._df_with_lots)
+        self.destroy()
+
+    def _on_no_split(self):
+        df = self.df.copy()
+        df["ロット"] = 1
+        self.result = ("ok", df)
+        self.destroy()
+
+    def _on_manual(self):
+        self.result = ("manual", None)
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = ("cancel", None)
+        self.destroy()
+
+
+# =========================
+# ■ CSV正規化
+# =========================
+def normalize_columns(file):
+
+    try:
+        df = pd.read_csv(file, encoding="cp932")
+    except Exception:
+        df = pd.read_csv(file, encoding="utf-8-sig")
+
+    df.columns = df.columns.str.replace("　", "").str.replace(" ", "").str.strip()
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    cols = df.columns.tolist()
+
+    # ===== アンリツ =====
+    if any("測定値" in col for col in cols) and any("ランクコード" in col for col in cols):
+
+        rename_map = {}
+        for col in cols:
+            if col == "測定値出力No.":
+                rename_map[col] = "測定値出力No."
+            elif col == "測定値(g)":
+                rename_map[col] = "測定値(g)"
+            elif "ランクコード" in col:
+                rename_map[col] = "ランクコード"
+            elif "日付時刻" in col:
+                rename_map[col] = "日付時刻"
+
+        df = df.rename(columns=rename_map)
+
+        if "日付時刻" not in df.columns:
+            if "日付" in df.columns and "時刻" in df.columns:
+                df["日付時刻"] = pd.to_datetime(
+                    df["日付"].astype(str) + " " + df["時刻"].astype(str),
+                    errors="coerce"
+                )
+
+        df["メーカー"] = "アンリツ"
+        df = df[["測定値出力No.", "日付時刻", "測定値(g)", "ランクコード", "メーカー"]].copy()
+        df["測定値出力No."] = pd.to_numeric(df["測定値出力No."], errors="coerce")
+        df["測定値(g)"] = pd.to_numeric(df["測定値(g)"], errors="coerce")
+        df["ランクコード"] = df["ランクコード"].astype(str).str.strip()
+        df["日付時刻"] = pd.to_datetime(df["日付時刻"], errors="coerce")
+        return df
+
+    # ===== イシダ =====
+    try:
+        df = pd.read_csv(file, encoding="cp932", skiprows=10)
+    except Exception:
+        df = pd.read_csv(file, encoding="utf-8-sig", skiprows=10)
+
+    df.columns = df.columns.str.replace("　", "").str.replace(" ", "").str.strip()
+    df = df.iloc[:, [0, 1, 4, 5]].copy()
+    df.columns = ["日付", "時刻", "測定値(g)", "判定"]
+
+    df["日付時刻"] = pd.to_datetime(
+        df["日付"].astype(str) + " " + df["時刻"].astype(str),
+        errors="coerce"
+    )
+    df["測定値出力No."] = range(1, len(df) + 1)
+    rank_map = {"正量": "2", "軽量": "1", "過量": "E"}
+    df["ランクコード"] = df["判定"].map(rank_map)
+    df["メーカー"] = "イシダ"
+
+    return df[["測定値出力No.", "日付時刻", "測定値(g)", "ランクコード", "メーカー"]]
+
+
+# =========================
+# ■ 分析
+# =========================
 def analyze(data):
-    mean = data.mean()
-    std = data.std()
+
+    data = np.asarray(data).astype(float).ravel()
+    data = data[~np.isnan(data)]
+
     n = len(data)
+    if n < 2:
+        return None, None, (None, None), None, None, None, None
 
-    ci = stats.t.interval(0.95, df=n-1, loc=mean, scale=std/np.sqrt(n))
+    mean = float(np.mean(data))
+    std = float(np.std(data, ddof=1))
 
-    max1 = data.max()
-    min1 = data.min()
+    t_value = stats.t.ppf(0.975, df=n - 1)
+    margin = t_value * std / np.sqrt(n)
 
-    lower = mean - 3*std
-    upper = mean + 3*std
-    outliers = data[(data < lower) | (data > upper)]
+    max1 = float(np.max(data))
+    min1 = float(np.min(data))
+    lower = mean - 3 * std
+    upper = mean + 3 * std
 
-    return mean, std, ci, max1, min1, outliers
+    return mean, std, (mean - margin, mean + margin), max1, min1, lower, upper
 
-def save_to_excel(data, clean, mean, std, ci, max1, min1,  outliers,
-                  mean2, std2, ci2, max2, min2,
-                  img1_buffer, img2_buffer, filename):
+
+# =========================
+# ■ Excel出力
+# =========================
+def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
+                  outliers_df, img_hist, img_series, rank_counts, filename, lot):
+
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.drawing.image import Image
+
+    red_fill = PatternFill(start_color="FFFF0000", fill_type="solid")
+    header_fill = PatternFill(start_color="FF4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFFFF")
+    result_fill = PatternFill(start_color="FFE7E6E6", fill_type="solid")
+    center_align = Alignment(horizontal="center", vertical="center")
+    border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
 
     result_df = pd.DataFrame({
-        "項目": ["平均", "標準偏差", "データ数", "Max", "Min", "CI下限", "CI上限", "外れ値数"],
-        "全データ": [mean, std, len(data), max1, min1,  ci[0], ci[1], len(outliers)],
-        "外れ値除外後": [mean2, std2, len(clean), max2, min2, ci2[0], ci2[1], 0]
+        "項目": ["平均", "標準偏差", "データ数", "Max", "Min", "下限(-3σ)", "上限(+3σ)"],
+        "値": [mean, std, len(df_ok), max1, min1, lower, upper]
     })
 
-    if len(outliers) > 0:
-        outlier_df = outliers.to_frame(name="外れ値")
-    else:
-        outlier_df = pd.DataFrame({"外れ値": []})
-
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+
         result_df.to_excel(writer, sheet_name="統計結果", index=False)
-        outlier_df.to_excel(writer, sheet_name="外れ値(±３σ以上)", index=False)
-        data.to_frame(name="全データ").to_excel(writer, sheet_name="元データ", index=False)
-        clean.to_frame(name="外れ値除外後").to_excel(writer, sheet_name="外れ値除外後データ", index=False)
+        df_ok[["測定値出力No.", "日付時刻", "測定値(g)"]].to_excel(writer, sheet_name="OKデータ", index=False)
+        outliers_df[["測定値出力No.", "日付時刻", "測定値(g)"]].to_excel(writer, sheet_name="外れ値", index=False)
+        rank_counts.to_excel(writer, sheet_name="ランクコード集計", index=False)
 
-        # グラフ貼り付け（メモリ画像）
-        from openpyxl.drawing.image import Image
-        workbook = writer.book
-        sheet = workbook.create_sheet("グラフ")
+        wb = writer.book
 
-        img_obj1 = Image(img1_buffer)
-        img_obj2 = Image(img2_buffer)
+        # ===== 統計結果シート =====
+        ws_result = wb["統計結果"]
+        ws_result.column_dimensions["A"].width = 20
+        ws_result.column_dimensions["B"].width = 20
+        for cell in ws_result[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = border
+        for row in ws_result.iter_rows(min_row=2, max_row=ws_result.max_row):
+            for cell in row:
+                cell.fill = result_fill
+                cell.border = border
+                cell.alignment = center_align
+                if cell.column == 2:
+                    item = ws_result.cell(row=cell.row, column=1).value
+                    if item == "標準偏差":
+                        cell.number_format = "0.000"
+                    elif item == "データ数":
+                        cell.number_format = "0"
+                    else:
+                        cell.number_format = "0.0"
 
-        sheet.add_image(img_obj1, "A1")
-        sheet.add_image(img_obj2, "A25")
+        # ===== ランクコード集計シート =====
+        ws_rank = wb["ランクコード集計"]
+        ws_rank.column_dimensions["A"].width = 15
+        ws_rank.column_dimensions["B"].width = 15
+        ws_rank.column_dimensions["C"].width = 20
+        for cell in ws_rank[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = border
+        for row in ws_rank.iter_rows(min_row=2, max_row=ws_rank.max_row):
+            for cell in row:
+                cell.border = border
+                cell.alignment = center_align
+                if row[0].row % 2 == 0:
+                    cell.fill = PatternFill(start_color="FFF2F2F2", fill_type="solid")
 
-def run():
+        # ===== OKデータシート =====
+        ws_ok = wb["OKデータ"]
+        ws_ok.column_dimensions["A"].width = 18
+        ws_ok.column_dimensions["B"].width = 22
+        ws_ok.column_dimensions["C"].width = 15
+        for cell in ws_ok[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = border
+        for row in ws_ok.iter_rows(min_row=2, min_col=1, max_col=3):
+            for cell in row:
+                cell.border = border
+        for row in ws_ok.iter_rows(min_row=2, min_col=2, max_col=2):
+            for cell in row:
+                cell.number_format = "yyyy-mm-dd hh:mm:ss"
+        ws_ok.auto_filter.ref = f"A1:C{ws_ok.max_row}"
+        outlier_ids = set(outliers_df["測定値出力No."].values)
+        for row in ws_ok.iter_rows(min_row=2, max_row=ws_ok.max_row):
+            if row[0].value in outlier_ids:
+                for cell in row:
+                    cell.fill = red_fill
+
+        # ===== 外れ値シート =====
+        ws_out = wb["外れ値"]
+        ws_out.column_dimensions["A"].width = 18
+        ws_out.column_dimensions["B"].width = 22
+        ws_out.column_dimensions["C"].width = 15
+        for cell in ws_out[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = border
+        for row in ws_out.iter_rows(min_row=2, min_col=1, max_col=3):
+            for cell in row:
+                cell.border = border
+        for row in ws_out.iter_rows(min_row=2, min_col=2, max_col=2):
+            for cell in row:
+                cell.number_format = "yyyy-mm-dd hh:mm:ss"
+        ws_out.auto_filter.ref = f"A1:C{ws_out.max_row}"
+
+        # ===== グラフシート =====
+        ws_hist = wb.create_sheet("ヒストグラム")
+        ws_hist.add_image(Image(img_hist), "A1")
+
+        ws_series = wb.create_sheet("時系列チャート")
+        ws_series.add_image(Image(img_series), "A1")
+
+
+# =========================
+# ■ ロット処理
+# =========================
+def process_lot(group, lot, save_dir):
+
+    rank_map = {"2": "OK", "1": "軽量", "E": "過量", "0": "２個乗り"}
+
+    rank_counts = group["ランクコード"].value_counts().reset_index()
+    rank_counts.columns = ["ランクコード", "件数"]
+    rank_counts["内容"] = rank_counts["ランクコード"].map(rank_map)
+    rank_counts = rank_counts[["ランクコード", "内容", "件数"]]
+
+    df_ok = group[group["ランクコード"] == "2"].copy()
+
+    data = pd.to_numeric(df_ok["測定値(g)"], errors="coerce")
+    df_ok = df_ok.loc[data.notna()].copy()
+    data = data.loc[data.notna()]
+    data = np.asarray(data).ravel()
+
+    if len(data) < 2:
+        return
+
+    mean, std, ci, max1, min1, lower, upper = analyze(data)
+
+    outliers_df = df_ok[(df_ok["測定値(g)"] < lower) | (df_ok["測定値(g)"] > upper)]
+
+    # ===== ヒストグラム =====
+    fig1, ax1 = plt.subplots(figsize=(10, 6))
+    ax1.hist(data, bins=30, edgecolor="black", alpha=0.7)
+    ax1.axvline(mean, color="red", linestyle="-", linewidth=2, label=f"平均: {mean:.2f}")
+    ax1.axvline(lower, color="orange", linestyle="--", linewidth=2, label=f"下限(-3σ): {lower:.2f}")
+    ax1.axvline(upper, color="orange", linestyle="--", linewidth=2, label=f"上限(+3σ): {upper:.2f}")
+    ax1.set_title(f"ロット{lot} 測定値の分布（n={len(data)}）", fontsize=14, fontweight="bold")
+    ax1.set_xlabel("測定値(g)", fontsize=12)
+    ax1.set_ylabel("頻度", fontsize=12)
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    fig1.tight_layout()
+
+    img_hist = BytesIO()
+    fig1.savefig(img_hist, format="png", dpi=100, bbox_inches="tight")
+    img_hist.seek(0)
+    plt.close(fig1)
+
+    # ===== 時系列チャート =====
+    fig2, ax2 = plt.subplots(figsize=(12, 5))
+
+    y_vals = df_ok["測定値(g)"].values
+    outlier_mask = (df_ok["測定値(g)"] < lower) | (df_ok["測定値(g)"] > upper)
+    has_datetime = df_ok["日付時刻"].notna().any()
+
+    if has_datetime:
+        x_all = df_ok["日付時刻"]
+        x_ok  = df_ok.loc[~outlier_mask, "日付時刻"]
+        x_out = df_ok.loc[outlier_mask,  "日付時刻"]
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+        plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right")
+        ax2.set_xlabel("時刻", fontsize=12)
+    else:
+        x_all = np.arange(1, len(df_ok) + 1)
+        x_ok  = x_all[~outlier_mask.values]
+        x_out = x_all[outlier_mask.values]
+        ax2.set_xlabel("測定順序", fontsize=12)
+
+    y_ok  = y_vals[~outlier_mask.values]
+    y_out = y_vals[outlier_mask.values]
+
+    ax2.plot(x_all, y_vals, color="steelblue", linewidth=0.6, alpha=0.4, zorder=1)
+    ax2.scatter(x_ok, y_ok, color="steelblue", s=18, alpha=0.8, zorder=2, label="OK")
+    if len(x_out) > 0:
+        ax2.scatter(x_out, y_out, color="red", s=50, marker="x",
+                    linewidths=2, zorder=3, label=f"外れ値 ({len(x_out)}件)")
+
+    ax2.axhline(mean,  color="red",    linewidth=1.5, linestyle="-",  label=f"平均: {mean:.2f}")
+    ax2.axhline(upper, color="orange", linewidth=1.5, linestyle="--", label=f"+3σ: {upper:.2f}")
+    ax2.axhline(lower, color="orange", linewidth=1.5, linestyle="--", label=f"-3σ: {lower:.2f}")
+
+    ax2.set_title(f"ロット{lot} 時系列チャート（n={len(df_ok)}）", fontsize=14, fontweight="bold")
+    ax2.set_ylabel("測定値(g)", fontsize=12)
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    fig2.tight_layout()
+
+    img_series = BytesIO()
+    fig2.savefig(img_series, format="png", dpi=100, bbox_inches="tight")
+    img_series.seek(0)
+    plt.close(fig2)
+
+    filename = os.path.join(
+        save_dir,
+        f"分析結果_ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
+    )
+
+    save_to_excel(df_ok, mean, std, ci, max1, min1,
+                  lower, upper, outliers_df,
+                  img_hist, img_series, rank_counts, filename, lot)
+
+
+# =========================
+# ■ ファイル処理
+# =========================
+def process_file(file):
     try:
-        file = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
-        df = pd.read_csv(file, encoding="cp932")
+        if not file or not os.path.exists(file):
+            messagebox.showerror("エラー", "ファイルが見つかりません")
+            return
 
-        # 前処理
-        df.columns = df.columns.str.replace("　", "").str.strip()
-        df = df.replace(r"^\s*$", np.nan, regex=True)
-        df = df.dropna(axis=1, how="all")
-        df["測定値(g)"] = pd.to_numeric(df["測定値(g)"], errors="coerce")
+        save_dir = os.path.dirname(file)
+        df = normalize_columns(file)
 
-        data = df["測定値(g)"].dropna()
+        dialog = LotPreviewDialog(app_root, df)
+        app_root.wait_window(dialog)
 
-        # 全データ分析
-        mean, std, ci, max1, min1, outliers = analyze(data)
+        if dialog.result is None or dialog.result[0] == "cancel":
+            return
+        if dialog.result[0] == "manual":
+            messagebox.showwarning("中止", "CSVを手動分割してください")
+            return
 
-        result = f"""
-【全データ】
-平均: {mean:.3f}
-σ: {std:.3f}
-データ数: {len(data)}
-Max: {max1:.3f}
-Min: {min1:.3f}
+        df = dialog.result[1]
 
-95%信頼区間:
-{ci[0]:.3f} ～ {ci[1]:.3f}
+        for lot, group in df.groupby("ロット"):
+            process_lot(group, lot, save_dir)
 
-外れ値数: {len(outliers)}
-"""
-        messagebox.showinfo("結果", result)
-
-        # グラフ①（全データ）
-        plt.figure()
-        plt.hist(data, bins=30)
-        plt.axvline(mean, label="平均")
-        plt.title("重量分布（全データ）")
-        plt.legend()
-        plt.grid(True)
-
-        img1_buffer = BytesIO()
-        plt.savefig(img1_buffer, format="png")
-        img1_buffer.seek(0)
-        plt.close()
-
-        # 外れ値表示
-        if len(outliers) > 0:
-            messagebox.showinfo("外れ値一覧", str(outliers.values))
-
-        # 外れ値除外
-        clean = data[~data.isin(outliers)]
-
-        mean2, std2, ci2, max2, min2, _ = analyze(clean)
-
-        result2 = f"""
-【外れ値除外後】
-平均: {mean2:.3f}
-σ: {std2:.3f}
-データ数: {len(clean)}
-Max: {max2:.3f}
-Min: {min2:.3f}
-
-95%信頼区間:
-{ci2[0]:.3f} ～ {ci2[1]:.3f}
-"""
-        messagebox.showinfo("結果（外れ値除外後）", result2)
-
-        # グラフ②（除外後）
-        plt.figure()
-        plt.hist(clean, bins=30)
-        plt.axvline(mean2, label="平均")
-        plt.title("重量分布（外れ値除外後）")
-        plt.legend()
-        plt.grid(True)
-
-        img2_buffer = BytesIO()
-        plt.savefig(img2_buffer, format="png")
-        img2_buffer.seek(0)
-        plt.close()
-
-        # Excel保存
-        if messagebox.askyesno("確認", "Excel保存しますか？"):
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".xlsx",
-                initialfile=f"分析結果_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
-            )
-
-            save_to_excel(data, clean, mean, std, ci, max1, min1,  outliers,
-                          mean2, std2, ci2, max2, min2,
-                          img1_buffer, img2_buffer, filename)
-
-            messagebox.showinfo("完了", "Excel保存完了！")
+        messagebox.showinfo("完了", "Excel作成完了")
 
     except Exception as e:
         messagebox.showerror("エラー", str(e))
 
-# GUI
-root = tk.Tk()
-root.title("重量分析ツール（完成版）")
 
-btn = tk.Button(root, text="CSV選択して解析", command=run, height=2, width=30)
-btn.pack(pady=20)
+# =========================
+# ■ メイン
+# =========================
+def run():
+    file = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+    if file:
+        process_file(file)
 
-root.mainloop()
+
+def on_closing():
+    if app_root:
+        app_root.destroy()
+
+
+if __name__ == "__main__":
+    app_root = tk.Tk()
+    app_root.title("重量分析ツール")
+    app_root.protocol("WM_DELETE_WINDOW", on_closing)
+
+    btn = tk.Button(app_root, text="CSV選択して解析", command=run, height=2, width=30)
+    btn.pack(pady=20)
+
+    if len(sys.argv) > 1:
+        csv_file_to_process = sys.argv[1]
+        app_root.after(500, lambda: process_file(csv_file_to_process))
+
+    app_root.mainloop()
