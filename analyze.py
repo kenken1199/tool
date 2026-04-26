@@ -1,6 +1,8 @@
+import platform
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.font_manager as fm
 import numpy as np
 from scipy import stats
 import tkinter as tk
@@ -10,7 +12,20 @@ from io import BytesIO
 import os
 import sys
 
-plt.rcParams["font.family"] = "MS Gothic"
+
+def _setup_japanese_font():
+    candidates = {
+        "Windows": ["MS Gothic", "Yu Gothic", "Meiryo"],
+        "Darwin":  ["Hiragino Sans", "Hiragino Maru Gothic Pro", "AppleGothic"],
+        "Linux":   ["Noto Sans CJK JP", "IPAGothic", "IPAPGothic"],
+    }.get(platform.system(), [])
+    available = {f.name for f in fm.fontManager.ttflist}
+    for font in candidates:
+        if font in available:
+            plt.rcParams["font.family"] = font
+            return
+
+_setup_japanese_font()
 
 app_root = None
 csv_file_to_process = None
@@ -128,16 +143,23 @@ class LotPreviewDialog(tk.Toplevel):
 # =========================
 # ■ CSV正規化
 # =========================
+_ISHIDA_RANK_VALUES = {"正量", "軽量", "過量"}
+
+
+def _read_csv(file, **kwargs):
+    for enc in ("cp932", "utf-8-sig"):
+        try:
+            return pd.read_csv(file, encoding=enc, **kwargs)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"CSVのエンコーディングを判別できませんでした: {os.path.basename(file)}")
+
+
 def normalize_columns(file):
 
-    try:
-        df = pd.read_csv(file, encoding="cp932")
-    except Exception:
-        df = pd.read_csv(file, encoding="utf-8-sig")
-
+    df = _read_csv(file)
     df.columns = df.columns.str.replace("　", "").str.replace(" ", "").str.strip()
     df = df.loc[:, ~df.columns.duplicated()]
-
     cols = df.columns.tolist()
 
     # ===== アンリツ =====
@@ -171,26 +193,33 @@ def normalize_columns(file):
         df["日付時刻"] = pd.to_datetime(df["日付時刻"], errors="coerce")
         return df
 
-    # ===== イシダ =====
-    try:
-        df = pd.read_csv(file, encoding="cp932", skiprows=10)
-    except Exception:
-        df = pd.read_csv(file, encoding="utf-8-sig", skiprows=10)
+    # ===== イシダ判定 =====
+    df_ishida = _read_csv(file, skiprows=10)
+    df_ishida.columns = df_ishida.columns.str.replace("　", "").str.replace(" ", "").str.strip()
 
-    df.columns = df.columns.str.replace("　", "").str.replace(" ", "").str.strip()
-    df = df.iloc[:, [0, 1, 4, 5]].copy()
-    df.columns = ["日付", "時刻", "測定値(g)", "判定"]
+    is_ishida = (
+        len(df_ishida.columns) >= 6
+        and df_ishida.iloc[:, 5].dropna().astype(str).isin(_ISHIDA_RANK_VALUES).any()
+    )
+    if not is_ishida:
+        raise ValueError(
+            f"未対応のCSVフォーマットです。アンリツまたはイシダ形式のCSVを選択してください。\n"
+            f"ファイル: {os.path.basename(file)}"
+        )
 
-    df["日付時刻"] = pd.to_datetime(
-        df["日付"].astype(str) + " " + df["時刻"].astype(str),
+    df_ishida = df_ishida.iloc[:, [0, 1, 4, 5]].copy()
+    df_ishida.columns = ["日付", "時刻", "測定値(g)", "判定"]
+
+    df_ishida["日付時刻"] = pd.to_datetime(
+        df_ishida["日付"].astype(str) + " " + df_ishida["時刻"].astype(str),
         errors="coerce"
     )
-    df["測定値出力No."] = range(1, len(df) + 1)
+    df_ishida["測定値出力No."] = range(1, len(df_ishida) + 1)
     rank_map = {"正量": "2", "軽量": "1", "過量": "E"}
-    df["ランクコード"] = df["判定"].map(rank_map)
-    df["メーカー"] = "イシダ"
+    df_ishida["ランクコード"] = df_ishida["判定"].map(rank_map)
+    df_ishida["メーカー"] = "イシダ"
 
-    return df[["測定値出力No.", "日付時刻", "測定値(g)", "ランクコード", "メーカー"]]
+    return df_ishida[["測定値出力No.", "日付時刻", "測定値(g)", "ランクコード", "メーカー"]]
 
 
 # =========================
