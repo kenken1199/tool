@@ -13,6 +13,12 @@ import os
 import sys
 
 
+# =========================
+# ■ 定数
+# =========================
+MIN_OK_COUNT = 2  # 統計分析に必要な最小OKデータ数
+
+
 def _setup_japanese_font():
     candidates = {
         "Windows": ["MS Gothic", "Yu Gothic", "Meiryo"],
@@ -63,17 +69,27 @@ class LotPreviewDialog(tk.Toplevel):
         frame_tree = ttk.Frame(self, padding=10)
         frame_tree.pack(fill="both", expand=True)
 
-        cols = ("ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数")
+        cols = ("ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数", "状態")
         self.tree = ttk.Treeview(frame_tree, columns=cols, show="headings", height=10)
-        col_widths = {"ロット": 70, "開始時刻": 150, "終了時刻": 150, "総件数": 80, "OKデータ件数": 110}
+        col_widths = {"ロット": 70, "開始時刻": 150, "終了時刻": 150,
+                      "総件数": 80, "OKデータ件数": 110, "状態": 110}
         for col in cols:
             self.tree.heading(col, text=col)
             self.tree.column(col, anchor="center", width=col_widths[col])
+
+        # 警告色タグ（OKデータ不足のロットを赤系で強調）
+        self.tree.tag_configure("skip", background="#FFE4E1", foreground="#9C0006")
 
         scrollbar = ttk.Scrollbar(frame_tree, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        # --- 注意書きラベル ---
+        self.warn_label_var = tk.StringVar()
+        warn_label = ttk.Label(self, textvariable=self.warn_label_var,
+                               foreground="#9C0006", padding=(10, 0))
+        warn_label.pack(fill="x")
 
         # --- ボタン ---
         frame_btn = ttk.Frame(self, padding=(10, 5, 10, 10))
@@ -104,20 +120,43 @@ class LotPreviewDialog(tk.Toplevel):
             self.tree.delete(item)
 
         lot_count = df["ロット"].nunique()
-        self.lot_label_var.set(f"→ {lot_count} ロット検出")
+        skip_count = 0
 
         for lot, group in df.groupby("ロット"):
             start = group["日付時刻"].min()
             end = group["日付時刻"].max()
             total = len(group)
             ok_count = int((group["ランクコード"] == "2").sum())
-            self.tree.insert("", "end", values=(
+
+            if ok_count < MIN_OK_COUNT:
+                state = "⚠ スキップ予定"
+                tags = ("skip",)
+                skip_count += 1
+            else:
+                state = "✓ 分析対象"
+                tags = ()
+
+            self.tree.insert("", "end", tags=tags, values=(
                 f"ロット{lot}",
                 start.strftime("%Y-%m-%d %H:%M") if pd.notna(start) else "-",
                 end.strftime("%Y-%m-%d %H:%M") if pd.notna(end) else "-",
                 total,
                 ok_count,
+                state,
             ))
+
+        # 上部ラベル
+        if skip_count > 0:
+            self.lot_label_var.set(
+                f"→ {lot_count} ロット検出（うち {skip_count} ロットはOKデータ不足でスキップ予定）"
+            )
+            self.warn_label_var.set(
+                f"※ OKデータが {MIN_OK_COUNT} 件未満のロットは統計計算ができないため、"
+                f"Excelファイルは作成されません。しきい値を変更してロットを統合することも検討してください。"
+            )
+        else:
+            self.lot_label_var.set(f"→ {lot_count} ロット検出")
+            self.warn_label_var.set("")
 
         self._df_with_lots = df
 
@@ -374,6 +413,12 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
 # ■ ロット処理
 # =========================
 def process_lot(group, lot, save_dir):
+    """
+    1ロット分の分析を行いExcelを出力する。
+    戻り値:
+        ("ok",   ok_count) … 正常に作成
+        ("skip", ok_count) … OKデータ不足によりスキップ
+    """
 
     rank_map = {"2": "OK", "1": "軽量", "E": "過量", "0": "２個乗り"}
 
@@ -389,8 +434,8 @@ def process_lot(group, lot, save_dir):
     data = data.loc[data.notna()]
     data = np.asarray(data).ravel()
 
-    if len(data) < 2:
-        return
+    if len(data) < MIN_OK_COUNT:
+        return ("skip", len(data))
 
     mean, std, ci, max1, min1, lower, upper = analyze(data)
 
@@ -468,6 +513,8 @@ def process_lot(group, lot, save_dir):
                   lower, upper, outliers_df,
                   img_hist, img_series, rank_counts, filename, lot)
 
+    return ("ok", len(data))
+
 
 # =========================
 # ■ ファイル処理
@@ -492,10 +539,43 @@ def process_file(file):
 
         df = dialog.result[1]
 
-        for lot, group in df.groupby("ロット"):
-            process_lot(group, lot, save_dir)
+        # 結果集計
+        created_lots = []   # [(lot, ok_count), ...]
+        skipped_lots = []   # [(lot, ok_count, total_count), ...]
 
-        messagebox.showinfo("完了", "Excel作成完了")
+        for lot, group in df.groupby("ロット"):
+            total = len(group)
+            status, ok_count = process_lot(group, lot, save_dir)
+            if status == "ok":
+                created_lots.append((lot, ok_count))
+            else:
+                skipped_lots.append((lot, ok_count, total))
+
+        # ===== 完了メッセージ =====
+        if not created_lots and skipped_lots:
+            # すべてスキップされた異常ケース
+            msg = "Excelファイルは作成されませんでした。\n\n"
+            msg += "すべてのロットでOKデータが不足しています:\n"
+            for lot, ok, total in skipped_lots:
+                msg += f"  ・ロット{lot}: 総{total}件 / OK{ok}件\n"
+            msg += "\nしきい値を変更するか、CSVの内容をご確認ください。"
+            messagebox.showerror("作成失敗", msg)
+
+        elif skipped_lots:
+            # 一部スキップ
+            msg = f"Excel作成完了\n作成: {len(created_lots)}ファイル\n\n"
+            msg += "⚠ 以下のロットはOKデータ不足のためスキップしました:\n"
+            for lot, ok, total in skipped_lots:
+                msg += f"  ・ロット{lot}: 総{total}件 / OK{ok}件\n"
+            msg += f"\n（OKデータが {MIN_OK_COUNT} 件未満のロットは統計計算ができません）"
+            messagebox.showwarning("完了（一部スキップ）", msg)
+
+        else:
+            # 全件成功
+            messagebox.showinfo(
+                "完了",
+                f"Excel作成完了\n{len(created_lots)}ファイルを作成しました。"
+            )
 
     except Exception as e:
         messagebox.showerror("エラー", str(e))
