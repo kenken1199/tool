@@ -1,0 +1,681 @@
+"""
+==========================================================
+ RECORD フォルダ集計ツール（フェーズ1）
+==========================================================
+
+ アンリツ計量機の RECORD フォルダを横断スキャンし、
+ 品種番号ごとに統計値を集計する独立ツール。
+
+ 機能（フェーズ1）:
+   - RECORDフォルダ選択
+   - 全CSVスキャン（バックグラウンドスレッド・進捗表示）
+   - 同日・同品種のINDIV*.csv自動結合
+   - インデックスキャッシュ（mtime差分更新）
+   - 品種番号一覧表示（ソート・検索）
+
+ 想定フォルダ構造:
+   RECORD/
+   ├── 20250219/
+   │   ├── INDIV.csv
+   │   └── INDIV_01.csv  (容量分割 - 同品種の場合は結合)
+   ├── 20250220/
+   │   └── INDIV.csv
+   ...
+
+ キャッシュ: RECORDフォルダ直下に record_cache.json
+==========================================================
+"""
+
+import os
+import re
+import json
+import platform
+import threading
+import queue
+import datetime
+import traceback
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+from csv_normalizer import normalize_columns
+
+
+# =========================
+# ■ 定数
+# =========================
+CACHE_FILENAME = "record_cache.json"
+CACHE_VERSION = 1
+DATE_FOLDER_PATTERN = re.compile(r"^\d{8}$")  # 例: 20250219
+INDIV_PATTERN = re.compile(r"^INDIV(_\d+)?\.csv$", re.IGNORECASE)
+
+
+# =========================
+# ■ 日本語フォント設定
+# =========================
+def _setup_japanese_font():
+    candidates = {
+        "Windows": ["MS Gothic", "Yu Gothic", "Meiryo"],
+        "Darwin":  ["Hiragino Sans", "Hiragino Maru Gothic Pro", "AppleGothic"],
+        "Linux":   ["Noto Sans CJK JP", "IPAGothic", "IPAPGothic"],
+    }.get(platform.system(), [])
+    available = {f.name for f in fm.fontManager.ttflist}
+    for font in candidates:
+        if font in available:
+            plt.rcParams["font.family"] = font
+            return
+
+_setup_japanese_font()
+
+
+# =========================
+# ■ スキャン処理（バックグラウンド）
+# =========================
+def find_indiv_csvs(record_dir):
+    """
+    RECORDフォルダ配下のINDIV*.csvを列挙する。
+
+    Returns:
+        list of (relpath, abspath, mtime, size, date_folder)
+        relpath: RECORDからの相対パス（キャッシュキー用）
+    """
+    found = []
+    for entry in sorted(os.listdir(record_dir)):
+        date_folder_path = os.path.join(record_dir, entry)
+        if not os.path.isdir(date_folder_path):
+            continue
+        if not DATE_FOLDER_PATTERN.match(entry):
+            continue
+        for fname in sorted(os.listdir(date_folder_path)):
+            if not INDIV_PATTERN.match(fname):
+                continue
+            abspath = os.path.join(date_folder_path, fname)
+            relpath = os.path.relpath(abspath, record_dir).replace("\\", "/")
+            try:
+                stat = os.stat(abspath)
+            except OSError:
+                continue
+            found.append({
+                "relpath": relpath,
+                "abspath": abspath,
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+                "date_folder": entry,
+                "filename": fname,
+            })
+    return found
+
+
+def analyze_csv_file(abspath):
+    """
+    1つのCSVから統計値を抽出する（軽量化したインデックスのみ）。
+
+    Returns:
+        dict（統計値）または None（読込失敗）
+    """
+    df, hinshoku_num = normalize_columns(abspath)
+    if hinshoku_num is None:
+        # 品種番号が取れない場合はスキップ（ただしファイル自体は記録）
+        hinshoku_num = -1
+
+    total_count = len(df)
+    ok_mask = df["ランクコード"].astype(str) == "2"
+    ng_count = int((~ok_mask).sum())
+    ok_count = int(ok_mask.sum())
+
+    # OKデータの統計値
+    ok_data = pd.to_numeric(df.loc[ok_mask, "測定値(g)"], errors="coerce").dropna()
+    if len(ok_data) >= 2:
+        mean = float(ok_data.mean())
+        std = float(ok_data.std(ddof=1))
+        vmin = float(ok_data.min())
+        vmax = float(ok_data.max())
+    elif len(ok_data) == 1:
+        mean = float(ok_data.iloc[0])
+        std = 0.0
+        vmin = mean
+        vmax = mean
+    else:
+        mean = std = vmin = vmax = None
+
+    # 開始・終了時刻
+    valid_dt = df["日付時刻"].dropna()
+    start = valid_dt.min().isoformat() if len(valid_dt) > 0 else None
+    end = valid_dt.max().isoformat() if len(valid_dt) > 0 else None
+
+    # ランクコード別件数
+    rank_counts = df["ランクコード"].astype(str).value_counts().to_dict()
+
+    return {
+        "品種番号": int(hinshoku_num),
+        "総件数": int(total_count),
+        "OK件数": int(ok_count),
+        "NG件数": int(ng_count),
+        "平均": mean,
+        "σ": std,
+        "Min": vmin,
+        "Max": vmax,
+        "開始": start,
+        "終了": end,
+        "ランクコード別": rank_counts,
+    }
+
+
+def scan_record_folder(record_dir, progress_queue, cancel_event):
+    """
+    RECORDフォルダをスキャンしてキャッシュを更新する。
+    バックグラウンドスレッドで実行される。
+
+    progress_queue: ("progress", current, total, filename) や
+                    ("done", index_data) や
+                    ("error", message) を送る
+    """
+    try:
+        # 既存キャッシュ読込
+        cache_path = os.path.join(record_dir, CACHE_FILENAME)
+        old_cache = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                    if cached.get("version") == CACHE_VERSION:
+                        old_cache = cached.get("files", {})
+            except (json.JSONDecodeError, OSError):
+                old_cache = {}
+
+        # ファイル列挙
+        progress_queue.put(("progress", 0, 0, "ファイル列挙中..."))
+        files = find_indiv_csvs(record_dir)
+        total = len(files)
+
+        if total == 0:
+            progress_queue.put(("error",
+                "INDIV.csvが見つかりません。\nRECORDフォルダの構造をご確認ください。"))
+            return
+
+        new_cache = {}
+        errors = []
+        reused = 0
+        rescanned = 0
+
+        for i, file_info in enumerate(files):
+            if cancel_event.is_set():
+                progress_queue.put(("cancelled", None))
+                return
+
+            relpath = file_info["relpath"]
+            mtime = file_info["mtime"]
+            size = file_info["size"]
+
+            progress_queue.put(("progress", i + 1, total, relpath))
+
+            # キャッシュヒット判定
+            old_entry = old_cache.get(relpath)
+            if (old_entry
+                and old_entry.get("mtime") == mtime
+                and old_entry.get("size") == size):
+                new_cache[relpath] = old_entry
+                reused += 1
+                continue
+
+            # 再スキャン
+            try:
+                stats = analyze_csv_file(file_info["abspath"])
+                new_cache[relpath] = {
+                    "mtime": mtime,
+                    "size": size,
+                    "date_folder": file_info["date_folder"],
+                    "filename": file_info["filename"],
+                    **stats,
+                }
+                rescanned += 1
+            except Exception as e:
+                errors.append((relpath, str(e)))
+
+        # キャッシュ保存
+        cache_data = {
+            "version": CACHE_VERSION,
+            "scanned_at": datetime.datetime.now().isoformat(),
+            "record_dir": record_dir,
+            "files": new_cache,
+        }
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            errors.append(("(キャッシュ保存)", str(e)))
+
+        progress_queue.put(("done", {
+            "files": new_cache,
+            "reused": reused,
+            "rescanned": rescanned,
+            "errors": errors,
+            "record_dir": record_dir,
+        }))
+
+    except Exception as e:
+        progress_queue.put(("error",
+            f"スキャン中に予期せぬエラー:\n{e}\n\n{traceback.format_exc()}"))
+
+
+# =========================
+# ■ 品種番号ごとの集計
+# =========================
+def aggregate_by_hinshoku(file_index):
+    """
+    ファイル単位のインデックスを品種番号単位にロールアップする。
+    同一品種の複数日・複数ファイルを統合した統計値を計算する。
+
+    Returns:
+        list of dict（品種番号順）
+    """
+    by_hinshoku = defaultdict(list)
+    for relpath, info in file_index.items():
+        h = info.get("品種番号", -1)
+        by_hinshoku[h].append(info)
+
+    results = []
+    for hinshoku, file_list in by_hinshoku.items():
+        # 製造日（date_folder）の集合
+        date_folders = sorted({f["date_folder"] for f in file_list})
+
+        total_count = sum(f.get("総件数", 0) for f in file_list)
+        total_ok = sum(f.get("OK件数", 0) for f in file_list)
+        total_ng = sum(f.get("NG件数", 0) for f in file_list)
+
+        # 加重平均と統合σを計算（OK件数で重み付け）
+        # ファイル単位の (n_i, mean_i, std_i) から全体の (mean, std) を合成
+        means = []
+        stds = []
+        ns = []
+        mins = []
+        maxs = []
+        for f in file_list:
+            if f.get("平均") is not None and f.get("OK件数", 0) >= 1:
+                means.append(f["平均"])
+                stds.append(f.get("σ") or 0.0)
+                ns.append(f["OK件数"])
+                if f.get("Min") is not None:
+                    mins.append(f["Min"])
+                if f.get("Max") is not None:
+                    maxs.append(f["Max"])
+
+        if sum(ns) >= 2:
+            ns_arr = np.array(ns, dtype=float)
+            means_arr = np.array(means, dtype=float)
+            stds_arr = np.array(stds, dtype=float)
+            n_total = ns_arr.sum()
+            grand_mean = float(np.sum(ns_arr * means_arr) / n_total)
+            # 統合分散の公式: 各群の分散 + 平均の偏差の二乗
+            within = np.sum((ns_arr - 1) * stds_arr**2)
+            between = np.sum(ns_arr * (means_arr - grand_mean)**2)
+            grand_var = (within + between) / (n_total - 1)
+            grand_std = float(np.sqrt(grand_var))
+            overall_min = float(min(mins)) if mins else None
+            overall_max = float(max(maxs)) if maxs else None
+        else:
+            grand_mean = means[0] if means else None
+            grand_std = None
+            overall_min = mins[0] if mins else None
+            overall_max = maxs[0] if maxs else None
+
+        defect_rate = (total_ng / total_count * 100) if total_count > 0 else 0.0
+
+        # 推奨規格（平均±3σ）
+        if grand_mean is not None and grand_std is not None and grand_std > 0:
+            spec_lower = grand_mean - 3 * grand_std
+            spec_upper = grand_mean + 3 * grand_std
+        else:
+            spec_lower = spec_upper = None
+
+        # 最終製造日
+        last_date = date_folders[-1] if date_folders else None
+        first_date = date_folders[0] if date_folders else None
+
+        results.append({
+            "品種番号": hinshoku,
+            "製造日数": len(date_folders),
+            "ファイル数": len(file_list),
+            "総件数": total_count,
+            "OK件数": total_ok,
+            "NG件数": total_ng,
+            "不良率(%)": defect_rate,
+            "平均(g)": grand_mean,
+            "σ(g)": grand_std,
+            "Min(g)": overall_min,
+            "Max(g)": overall_max,
+            "推奨下限(g)": spec_lower,
+            "推奨上限(g)": spec_upper,
+            "初回製造日": first_date,
+            "最終製造日": last_date,
+            "_date_folders": date_folders,  # 詳細表示用
+            "_file_list": file_list,        # 詳細表示用
+        })
+
+    # 品種番号でソート（-1=不明は最後）
+    results.sort(key=lambda r: (r["品種番号"] < 0, r["品種番号"]))
+    return results
+
+
+# =========================
+# ■ メインアプリ
+# =========================
+class RecordAnalyzerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("RECORD フォルダ集計ツール")
+        self.root.geometry("1100x600")
+
+        self.record_dir = None
+        self.file_index = {}      # relpath -> info
+        self.aggregates = []      # aggregate_by_hinshokuの結果
+        self.scan_queue = None
+        self.cancel_event = None
+
+        self._build_ui()
+
+    # -------------------------
+    # UI構築
+    # -------------------------
+    def _build_ui(self):
+        # トップバー
+        top = ttk.Frame(self.root, padding=10)
+        top.pack(fill="x")
+
+        ttk.Button(top, text="📁 RECORDフォルダを選択",
+                   command=self._on_select_folder).pack(side="left")
+
+        self.folder_label_var = tk.StringVar(value="（フォルダ未選択）")
+        ttk.Label(top, textvariable=self.folder_label_var,
+                  foreground="gray").pack(side="left", padx=10)
+
+        ttk.Button(top, text="🔄 再スキャン",
+                   command=self._on_rescan).pack(side="right")
+
+        # 検索バー
+        search_bar = ttk.Frame(self.root, padding=(10, 0, 10, 5))
+        search_bar.pack(fill="x")
+        ttk.Label(search_bar, text="🔍 品種番号で絞込:").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._refresh_tree())
+        ttk.Entry(search_bar, textvariable=self.search_var, width=15).pack(side="left", padx=5)
+
+        self.summary_var = tk.StringVar()
+        ttk.Label(search_bar, textvariable=self.summary_var,
+                  foreground="navy").pack(side="left", padx=20)
+
+        # Treeview
+        tree_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        tree_frame.pack(fill="both", expand=True)
+
+        cols = ("品種番号", "製造日数", "総件数", "OK件数", "不良率(%)",
+                "平均(g)", "σ(g)", "Min(g)", "Max(g)",
+                "推奨下限(g)", "推奨上限(g)", "最終製造日")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=20)
+
+        col_widths = {
+            "品種番号": 75, "製造日数": 65, "総件数": 75, "OK件数": 75,
+            "不良率(%)": 70, "平均(g)": 75, "σ(g)": 70,
+            "Min(g)": 70, "Max(g)": 70,
+            "推奨下限(g)": 85, "推奨上限(g)": 85, "最終製造日": 95,
+        }
+
+        for col in cols:
+            self.tree.heading(col, text=col,
+                              command=lambda c=col: self._sort_by(c))
+            anchor = "center" if col in ("品種番号", "製造日数", "最終製造日") else "e"
+            self.tree.column(col, anchor=anchor, width=col_widths[col])
+
+        self.tree.tag_configure("warn", background="#FFF2CC")
+        self.tree.tag_configure("error", background="#FFE4E1")
+
+        sb_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        sb_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb_y.grid(row=0, column=1, sticky="ns")
+        sb_x.grid(row=1, column=0, sticky="ew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        # ステータスバー
+        self.status_var = tk.StringVar(value="RECORDフォルダを選択してください")
+        status = ttk.Label(self.root, textvariable=self.status_var,
+                          relief="sunken", anchor="w", padding=(5, 2))
+        status.pack(fill="x", side="bottom")
+
+        self._sort_state = {}  # col -> ascending bool
+
+    # -------------------------
+    # フォルダ選択 / スキャン起動
+    # -------------------------
+    def _on_select_folder(self):
+        folder = filedialog.askdirectory(title="RECORDフォルダを選択")
+        if not folder:
+            return
+        self.record_dir = folder
+        self.folder_label_var.set(folder)
+        self._start_scan()
+
+    def _on_rescan(self):
+        if not self.record_dir:
+            messagebox.showinfo("情報", "先にRECORDフォルダを選択してください")
+            return
+        self._start_scan()
+
+    def _start_scan(self):
+        # 進捗ダイアログを開いてバックグラウンドスレッドを開始
+        self.scan_queue = queue.Queue()
+        self.cancel_event = threading.Event()
+
+        progress_dialog = ProgressDialog(self.root, self.cancel_event)
+
+        thread = threading.Thread(
+            target=scan_record_folder,
+            args=(self.record_dir, self.scan_queue, self.cancel_event),
+            daemon=True,
+        )
+        thread.start()
+
+        self._poll_scan(progress_dialog)
+
+    def _poll_scan(self, progress_dialog):
+        try:
+            while True:
+                msg = self.scan_queue.get_nowait()
+                kind = msg[0]
+
+                if kind == "progress":
+                    _, current, total, fname = msg
+                    progress_dialog.update_progress(current, total, fname)
+
+                elif kind == "done":
+                    progress_dialog.close()
+                    self._on_scan_complete(msg[1])
+                    return
+
+                elif kind == "cancelled":
+                    progress_dialog.close()
+                    self.status_var.set("スキャンをキャンセルしました")
+                    return
+
+                elif kind == "error":
+                    progress_dialog.close()
+                    messagebox.showerror("スキャンエラー", msg[1])
+                    self.status_var.set("スキャンに失敗しました")
+                    return
+
+        except queue.Empty:
+            pass
+
+        # 100ms後にもう一度ポーリング
+        self.root.after(100, lambda: self._poll_scan(progress_dialog))
+
+    def _on_scan_complete(self, result):
+        self.file_index = result["files"]
+        reused = result["reused"]
+        rescanned = result["rescanned"]
+        errors = result["errors"]
+
+        self.aggregates = aggregate_by_hinshoku(self.file_index)
+        self._refresh_tree()
+
+        n_hinshoku = len(self.aggregates)
+        msg = (f"スキャン完了: {len(self.file_index)}ファイル "
+               f"(キャッシュ再利用 {reused} / 新規/更新 {rescanned})")
+        if errors:
+            msg += f" / エラー {len(errors)}件"
+        self.status_var.set(msg)
+
+        if errors:
+            err_text = "\n".join(f"  ・{r}: {e}" for r, e in errors[:10])
+            if len(errors) > 10:
+                err_text += f"\n  ...他 {len(errors) - 10}件"
+            messagebox.showwarning(
+                "一部のファイルが読み込めませんでした",
+                f"以下のファイルで問題が発生しました:\n\n{err_text}"
+            )
+
+        info_msg = f"✓ 品種数: {n_hinshoku} / ファイル数: {len(self.file_index)}"
+        if rescanned > 0 and reused > 0:
+            info_msg += f" / 差分更新: {rescanned}件"
+        self.summary_var.set(info_msg)
+
+    # -------------------------
+    # Treeview 更新
+    # -------------------------
+    def _refresh_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        keyword = self.search_var.get().strip()
+
+        for agg in self.aggregates:
+            hinshoku = agg["品種番号"]
+            if keyword and keyword not in str(hinshoku):
+                continue
+
+            tags = ()
+            if hinshoku < 0:
+                tags = ("error",)
+            elif agg["不良率(%)"] > 1.0:
+                tags = ("warn",)
+
+            self.tree.insert("", "end", tags=tags, values=(
+                hinshoku if hinshoku >= 0 else "(不明)",
+                agg["製造日数"],
+                f"{agg['総件数']:,}",
+                f"{agg['OK件数']:,}",
+                f"{agg['不良率(%)']:.2f}",
+                f"{agg['平均(g)']:.3f}" if agg['平均(g)'] is not None else "-",
+                f"{agg['σ(g)']:.4f}"  if agg['σ(g)']  is not None else "-",
+                f"{agg['Min(g)']:.2f}" if agg['Min(g)'] is not None else "-",
+                f"{agg['Max(g)']:.2f}" if agg['Max(g)'] is not None else "-",
+                f"{agg['推奨下限(g)']:.2f}" if agg['推奨下限(g)'] is not None else "-",
+                f"{agg['推奨上限(g)']:.2f}" if agg['推奨上限(g)'] is not None else "-",
+                agg["最終製造日"] or "-",
+            ))
+
+    def _sort_by(self, col):
+        """列ヘッダクリックでソート"""
+        if not self.aggregates:
+            return
+
+        ascending = not self._sort_state.get(col, False)
+        self._sort_state[col] = ascending
+
+        key_map = {
+            "品種番号":   lambda r: r["品種番号"],
+            "製造日数":   lambda r: r["製造日数"],
+            "総件数":     lambda r: r["総件数"],
+            "OK件数":     lambda r: r["OK件数"],
+            "不良率(%)":  lambda r: r["不良率(%)"],
+            "平均(g)":    lambda r: r["平均(g)"] if r["平均(g)"] is not None else float("-inf"),
+            "σ(g)":       lambda r: r["σ(g)"]    if r["σ(g)"]    is not None else float("-inf"),
+            "Min(g)":     lambda r: r["Min(g)"]  if r["Min(g)"]  is not None else float("-inf"),
+            "Max(g)":     lambda r: r["Max(g)"]  if r["Max(g)"]  is not None else float("-inf"),
+            "推奨下限(g)": lambda r: r["推奨下限(g)"] if r["推奨下限(g)"] is not None else float("-inf"),
+            "推奨上限(g)": lambda r: r["推奨上限(g)"] if r["推奨上限(g)"] is not None else float("-inf"),
+            "最終製造日": lambda r: r["最終製造日"] or "",
+        }
+        if col in key_map:
+            self.aggregates.sort(key=key_map[col], reverse=not ascending)
+            self._refresh_tree()
+
+
+# =========================
+# ■ 進捗ダイアログ
+# =========================
+class ProgressDialog(tk.Toplevel):
+    def __init__(self, parent, cancel_event):
+        super().__init__(parent)
+        self.title("スキャン中...")
+        self.cancel_event = cancel_event
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.grab_set()
+
+        frm = ttk.Frame(self, padding=20)
+        frm.pack()
+
+        self.message_var = tk.StringVar(value="準備中...")
+        ttk.Label(frm, textvariable=self.message_var,
+                  width=60).pack(anchor="w", pady=(0, 5))
+
+        self.progress = ttk.Progressbar(frm, length=400, mode="determinate")
+        self.progress.pack(pady=5)
+
+        self.detail_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=self.detail_var,
+                  foreground="gray", width=60).pack(anchor="w", pady=(5, 10))
+
+        ttk.Button(frm, text="キャンセル", command=self._on_cancel).pack()
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def update_progress(self, current, total, filename):
+        if total > 0:
+            pct = current / total * 100
+            self.progress["value"] = pct
+            self.message_var.set(f"スキャン中: {current} / {total} ファイル")
+        else:
+            self.progress["value"] = 0
+            self.message_var.set("ファイル列挙中...")
+
+        # 長いパスは末尾だけ表示
+        display = filename if len(filename) < 70 else "..." + filename[-67:]
+        self.detail_var.set(display)
+
+    def _on_cancel(self):
+        self.cancel_event.set()
+        self.message_var.set("キャンセル中...")
+
+    def close(self):
+        self.destroy()
+
+
+# =========================
+# ■ エントリポイント
+# =========================
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = RecordAnalyzerApp(root)
+
+    # 画面中央に
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    w = root.winfo_width()
+    h = root.winfo_height()
+    root.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    root.mainloop()
