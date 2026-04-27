@@ -310,6 +310,184 @@ def analyze(data):
 # =========================
 # ■ Excel出力
 # =========================
+def _create_report_sheet(wb, df_ok, mean, std, ci, max1, min1, lower, upper,
+                          outliers_df, img_hist_bytes, img_series_bytes, rank_counts,
+                          total_count, original_ok_count, hinshoku_num, date_str, lot):
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.drawing.image import Image
+
+    ws = wb.create_sheet("分析レポート", 0)
+
+    # スタイル
+    title_font  = Font(bold=True, size=16, color="FFFFFFFF")
+    title_fill  = PatternFill(start_color="FF1F3864", fill_type="solid")
+    sec_font    = Font(bold=True, size=10, color="FFFFFFFF")
+    sec_fill    = PatternFill(start_color="FF4472C4", fill_type="solid")
+    label_font  = Font(bold=True, size=10)
+    label_fill  = PatternFill(start_color="FFD9E1F2", fill_type="solid")
+    val_fill_e  = PatternFill(start_color="FFFFFFFF", fill_type="solid")
+    val_fill_o  = PatternFill(start_color="FFEFF3FB", fill_type="solid")
+    warn_fill   = PatternFill(start_color="FFFFF2CC", fill_type="solid")
+    warn_font   = Font(bold=True, size=10, color="FF7F6000")
+    thin = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
+    center = Alignment(horizontal="center", vertical="center")
+    left   = Alignment(horizontal="left", vertical="center", indent=1)
+
+    # 列幅
+    ws.column_dimensions["A"].width = 20
+    ws.column_dimensions["B"].width = 13
+    for col in ["D", "E", "F", "G", "H", "I", "J"]:
+        ws.column_dimensions[col].width = 10.4  # D〜J合計 ≈ 13.5cm
+
+    ng_count    = total_count - original_ok_count
+    defect_rate = (ng_count / total_count * 100) if total_count > 0 else 0.0
+
+    # タイトル行
+    if hinshoku_num is not None and date_str:
+        title = f"{date_str}製造   品種番号 {hinshoku_num}   ロット{lot}   分析レポート"
+    else:
+        title = f"ロット{lot}   分析レポート"
+
+    ws.merge_cells("A1:J1")
+    ws["A1"] = title
+    ws["A1"].font      = title_font
+    ws["A1"].fill      = title_fill
+    ws["A1"].alignment = center
+    ws.row_dimensions[1].height = 26
+
+    ws.merge_cells("K1:L1")
+    ws["K1"] = datetime.datetime.now().strftime("%Y年%m月%d日")
+    ws["K1"].font      = Font(bold=True, size=11, color="FFFFFFFF")
+    ws["K1"].fill      = title_fill
+    ws["K1"].alignment = Alignment(horizontal="right", vertical="center", indent=1)
+
+    # 統計セクションヘッダー
+    ws.merge_cells("A3:B3")
+    ws["A3"] = "■ 基本統計"
+    ws["A3"].font      = sec_font
+    ws["A3"].fill      = sec_fill
+    ws["A3"].alignment = center
+    ws.row_dimensions[3].height = 16
+
+    # 統計テーブル定義: (ラベル, 値, 書式, 警告フラグ)
+    stats_rows = [
+        ("全数",             total_count,                              "0",     False),
+        ("OK数",             original_ok_count,                       "0",     False),
+        ("NG数",             ng_count,                                 "0",     ng_count > 0),
+        ("不良率 (%)",        defect_rate,                              "0.00",  ng_count > 0),
+        (None, None, None, False),
+        ("平均 (g)",          mean,                                    "0.0", False),
+        ("標準偏差 (g)",       std,                                    "0.000", False),
+        ("OKデータ件数",      len(df_ok),                              "0",     False),
+        ("Max (g)",          max1,                                    "0.0", False),
+        ("Min (g)",          min1,                                    "0.0", False),
+        ("下限 −3σ (g)",     lower,                                   "0.0", False),
+        ("上限 +3σ (g)",     upper,                                   "0.0", False),
+        (None, None, None, False),
+        ("95% CI 下限 (g)",  ci[0] if ci[0] is not None else "−",    "0.0", False),
+        ("95% CI 上限 (g)",  ci[1] if ci[1] is not None else "−",    "0.0", False),
+        ("外れ値件数",         len(outliers_df),                        "0",     len(outliers_df) > 0),
+    ]
+
+    data_row = 4
+    stripe   = 0
+    for label, value, fmt, warn in stats_rows:
+        ws.row_dimensions[data_row].height = 5 if label is None else 14
+        if label is None:
+            data_row += 1
+            continue
+        vfill = warn_fill if warn else (val_fill_e if stripe % 2 == 0 else val_fill_o)
+        vfont = warn_font if warn else Font(size=10)
+
+        ws[f"A{data_row}"] = label
+        ws[f"A{data_row}"].font      = label_font
+        ws[f"A{data_row}"].fill      = label_fill
+        ws[f"A{data_row}"].border    = thin
+        ws[f"A{data_row}"].alignment = left
+
+        ws[f"B{data_row}"] = value
+        ws[f"B{data_row}"].font          = vfont
+        ws[f"B{data_row}"].fill          = vfill
+        ws[f"B{data_row}"].border        = thin
+        ws[f"B{data_row}"].alignment     = center
+        ws[f"B{data_row}"].number_format = fmt
+
+        data_row += 1
+        stripe   += 1
+
+    ws.row_dimensions[data_row].height = 7  # 統計〜ランク間ギャップ（行3〜25計≈10.5cm調整）
+
+    # ランクコード集計ミニテーブル
+    rank_row = data_row + 1
+    ws.merge_cells(f"A{rank_row}:B{rank_row}")
+    ws[f"A{rank_row}"] = "■ ランクコード集計"
+    ws[f"A{rank_row}"].font      = sec_font
+    ws[f"A{rank_row}"].fill      = sec_fill
+    ws[f"A{rank_row}"].alignment = center
+    ws.row_dimensions[rank_row].height = 16
+
+    rank_header_row = rank_row + 1
+    for ci_idx, col_name in enumerate([ "内容", "件数"]):
+        col_letter = ["A", "B", "C"][ci_idx] if ci_idx < 3 else "A"
+        cell = ws.cell(row=rank_header_row, column=ci_idx + 1, value=col_name)
+        cell.font      = Font(bold=True, color="FFFFFFFF")
+        cell.fill      = PatternFill(start_color="FF4472C4", fill_type="solid")
+        cell.border    = thin
+        cell.alignment = center
+    ws.row_dimensions[rank_header_row].height = 14
+
+    for r_idx, row_data in rank_counts[["内容", "件数"]].iterrows():
+        r = rank_header_row + 1 + r_idx
+        rfill = val_fill_e if r_idx % 2 == 0 else val_fill_o
+        for c_idx, val in enumerate(row_data):
+            cell = ws.cell(row=r, column=c_idx + 1, value=val)
+            cell.fill      = rfill
+            cell.border    = thin
+            cell.alignment = center
+        ws.row_dimensions[r].height = 13
+
+    # ヒストグラム (D3:J25 に TwoCellAnchor で固定 ≈ 13.5cm × 10.5cm)
+    from openpyxl.drawing.spreadsheet_drawing import TwoCellAnchor, AnchorMarker
+    img1 = Image(BytesIO(img_hist_bytes))
+    img1.width  = 510  # fallback: 13.5cm
+    img1.height = 397  # fallback: 10.5cm
+    anchor1 = TwoCellAnchor(editAs="twoCell")
+    anchor1._from = AnchorMarker(col=3, colOff=0, row=2,  rowOff=0)  # D3  (0-indexed)
+    anchor1.to    = AnchorMarker(col=9, colOff=0, row=26, rowOff=0)  # J25 (0-indexed)
+    ws.add_image(img1, anchor1)
+
+    # 時系列チャート (下段)
+    series_row = max(data_row, rank_header_row + len(rank_counts) + 1) + 2
+    ws.merge_cells(f"A{series_row}:L{series_row}")
+    ws[f"A{series_row}"] = "■ 時系列チャート"
+    ws[f"A{series_row}"].font      = sec_font
+    ws[f"A{series_row}"].fill      = sec_fill
+    ws[f"A{series_row}"].alignment = center
+    ws.row_dimensions[series_row].height = 16
+
+    img2 = Image(BytesIO(img_series_bytes))
+    img2.width  = 907  # 24cm（紙幅いっぱい→fit-to-pageで左右対称に印刷）
+    img2.height = 378  # 10cm
+    ws.add_image(img2, f"A{series_row + 1}")
+
+    # A4縦・1ページ印刷設定
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins.left = 0.6
+    ws.page_margins.right = 0.6
+    ws.page_margins.top = 0.75
+    ws.page_margins.bottom = 0.75
+    ws.page_margins.header = 0.3
+    ws.page_margins.footer = 0.3
+
+
 def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                   outliers_df, img_hist, img_series, rank_counts, filename, lot,
                   total_count=0, original_ok_count=0, hinshoku_num=None, date_str=None):
@@ -331,8 +509,9 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
     defect_rate = (ng_count / total_count * 100) if total_count > 0 else 0.0
 
     result_df = pd.DataFrame({
-        "項目": ["全数", "OK数", "NG数", "不良率(%)", "平均", "標準偏差", "データ数", "Max", "Min", "下限(-3σ)", "上限(+3σ)"],
-        "値": [total_count, original_ok_count, ng_count, defect_rate, mean, std, len(df_ok), max1, min1, lower, upper]
+        "項目": ["全数", "OK数", "NG数", "不良率(%)", "平均", "標準偏差", "データ数", "Max", "Min", "下限(-3σ)", "上限(+3σ)", "95%CI 下限", "95%CI 上限"],
+        "値": [total_count, original_ok_count, ng_count, defect_rate, mean, std, len(df_ok), max1, min1, lower, upper,
+               ci[0] if ci[0] is not None else None, ci[1] if ci[1] is not None else None]
     })
 
     if hinshoku_num is not None and date_str:
@@ -445,11 +624,21 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
         ws_out.auto_filter.ref = f"A1:C{ws_out.max_row}"
 
         # ===== グラフシート =====
+        img_hist_bytes   = img_hist.getvalue()
+        img_series_bytes = img_series.getvalue()
+
         ws_hist = wb.create_sheet("ヒストグラム")
-        ws_hist.add_image(Image(img_hist), "A1")
+        ws_hist.add_image(Image(BytesIO(img_hist_bytes)), "A1")
 
         ws_series = wb.create_sheet("時系列チャート")
-        ws_series.add_image(Image(img_series), "A1")
+        ws_series.add_image(Image(BytesIO(img_series_bytes)), "A1")
+
+        # ===== 分析レポートシート (先頭に挿入) =====
+        _create_report_sheet(
+            wb, df_ok, mean, std, ci, max1, min1, lower, upper,
+            outliers_df, img_hist_bytes, img_series_bytes, rank_counts,
+            total_count, original_ok_count, hinshoku_num, date_str, lot
+        )
 
 
 # =========================
