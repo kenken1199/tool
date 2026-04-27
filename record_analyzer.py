@@ -51,7 +51,7 @@ from csv_normalizer import normalize_columns
 # ■ 定数
 # =========================
 CACHE_FILENAME = "record_cache.json"
-CACHE_VERSION = 1
+CACHE_VERSION = 2  # v2: ファイル内複数品種に対応（品種ごとに分割保存）
 DATE_FOLDER_PATTERN = re.compile(r"^\d{8}$")  # 例: 20250219
 INDIV_PATTERN = re.compile(r"^INDIV(_\d+)?\.csv$", re.IGNORECASE)
 
@@ -114,57 +114,74 @@ def find_indiv_csvs(record_dir):
 
 def analyze_csv_file(abspath):
     """
-    1つのCSVから統計値を抽出する（軽量化したインデックスのみ）。
+    1つのCSVから品種番号別に統計値を抽出する。
+    1ファイル内に複数品種が混在する場合、品種ごとに分けて統計を計算する。
 
     Returns:
-        dict（統計値）または None（読込失敗）
+        list of dict（品種ごとの統計値）
+        各dictは以下のキーを持つ:
+            品種番号, 総件数, OK件数, NG件数, 平均, σ, Min, Max,
+            開始, 終了, ランクコード別
+
+    Raises:
+        Exception: CSVが読めない場合（呼び出し側でcatch）
     """
-    df, hinshoku_num = normalize_columns(abspath)
-    if hinshoku_num is None:
-        # 品種番号が取れない場合はスキップ（ただしファイル自体は記録）
-        hinshoku_num = -1
-
-    total_count = len(df)
-    ok_mask = df["ランクコード"].astype(str) == "2"
-    ng_count = int((~ok_mask).sum())
-    ok_count = int(ok_mask.sum())
-
-    # OKデータの統計値
-    ok_data = pd.to_numeric(df.loc[ok_mask, "測定値(g)"], errors="coerce").dropna()
-    if len(ok_data) >= 2:
-        mean = float(ok_data.mean())
-        std = float(ok_data.std(ddof=1))
-        vmin = float(ok_data.min())
-        vmax = float(ok_data.max())
-    elif len(ok_data) == 1:
-        mean = float(ok_data.iloc[0])
-        std = 0.0
-        vmin = mean
-        vmax = mean
+    df, _ = normalize_columns(abspath, keep_hinshoku_column=True)
+    # 品種番号NaNは-1（不明）に統一
+    if "品種番号" in df.columns:
+        df["品種番号"] = pd.to_numeric(df["品種番号"], errors="coerce").fillna(-1).astype(int)
     else:
-        mean = std = vmin = vmax = None
+        df["品種番号"] = -1
 
-    # 開始・終了時刻
-    valid_dt = df["日付時刻"].dropna()
-    start = valid_dt.min().isoformat() if len(valid_dt) > 0 else None
-    end = valid_dt.max().isoformat() if len(valid_dt) > 0 else None
+    if len(df) == 0:
+        return []
 
-    # ランクコード別件数
-    rank_counts = df["ランクコード"].astype(str).value_counts().to_dict()
+    results = []
+    # 品種番号でグループ化（1ファイル内に複数品種があればここで分かれる）
+    for hinshoku, group in df.groupby("品種番号"):
+        total_count = len(group)
+        ok_mask = group["ランクコード"].astype(str) == "2"
+        ok_count = int(ok_mask.sum())
+        ng_count = int((~ok_mask).sum())
 
-    return {
-        "品種番号": int(hinshoku_num),
-        "総件数": int(total_count),
-        "OK件数": int(ok_count),
-        "NG件数": int(ng_count),
-        "平均": mean,
-        "σ": std,
-        "Min": vmin,
-        "Max": vmax,
-        "開始": start,
-        "終了": end,
-        "ランクコード別": rank_counts,
-    }
+        # OKデータの統計値
+        ok_data = pd.to_numeric(group.loc[ok_mask, "測定値(g)"], errors="coerce").dropna()
+        if len(ok_data) >= 2:
+            mean = float(ok_data.mean())
+            std = float(ok_data.std(ddof=1))
+            vmin = float(ok_data.min())
+            vmax = float(ok_data.max())
+        elif len(ok_data) == 1:
+            mean = float(ok_data.iloc[0])
+            std = 0.0
+            vmin = mean
+            vmax = mean
+        else:
+            mean = std = vmin = vmax = None
+
+        # 開始・終了時刻
+        valid_dt = group["日付時刻"].dropna()
+        start = valid_dt.min().isoformat() if len(valid_dt) > 0 else None
+        end = valid_dt.max().isoformat() if len(valid_dt) > 0 else None
+
+        # ランクコード別件数
+        rank_counts = group["ランクコード"].astype(str).value_counts().to_dict()
+
+        results.append({
+            "品種番号": int(hinshoku),
+            "総件数": int(total_count),
+            "OK件数": int(ok_count),
+            "NG件数": int(ng_count),
+            "平均": mean,
+            "σ": std,
+            "Min": vmin,
+            "Max": vmax,
+            "開始": start,
+            "終了": end,
+            "ランクコード別": rank_counts,
+        })
+
+    return results
 
 
 def scan_record_folder(record_dir, progress_queue, cancel_event):
@@ -215,25 +232,39 @@ def scan_record_folder(record_dir, progress_queue, cancel_event):
 
             progress_queue.put(("progress", i + 1, total, relpath))
 
-            # キャッシュヒット判定
-            old_entry = old_cache.get(relpath)
-            if (old_entry
-                and old_entry.get("mtime") == mtime
-                and old_entry.get("size") == size):
-                new_cache[relpath] = old_entry
+            # キャッシュヒット判定: 同じrelpathから始まるエントリがすべて
+            # 同じmtime/sizeなら再利用（ファイルが更新されていない）
+            cached_entries = {
+                k: v for k, v in old_cache.items()
+                if v.get("relpath") == relpath
+                and v.get("mtime") == mtime
+                and v.get("size") == size
+            }
+            if cached_entries:
+                new_cache.update(cached_entries)
                 reused += 1
                 continue
 
-            # 再スキャン
+            # 再スキャン（品種別の複数エントリが返る）
             try:
-                stats = analyze_csv_file(file_info["abspath"])
-                new_cache[relpath] = {
-                    "mtime": mtime,
-                    "size": size,
-                    "date_folder": file_info["date_folder"],
-                    "filename": file_info["filename"],
-                    **stats,
-                }
+                hinshoku_entries = analyze_csv_file(file_info["abspath"])
+                if not hinshoku_entries:
+                    errors.append((relpath, "有効なデータがありません"))
+                    continue
+
+                # 品種ごとに別エントリとしてキャッシュに登録
+                # キー: relpath#品種番号（複数品種混在ファイルを区別）
+                for entry in hinshoku_entries:
+                    h = entry["品種番号"]
+                    cache_key = f"{relpath}#{h}"
+                    new_cache[cache_key] = {
+                        "relpath": relpath,
+                        "mtime": mtime,
+                        "size": size,
+                        "date_folder": file_info["date_folder"],
+                        "filename": file_info["filename"],
+                        **entry,
+                    }
                 rescanned += 1
             except Exception as e:
                 errors.append((relpath, str(e)))
@@ -284,6 +315,11 @@ def aggregate_by_hinshoku(file_index):
     for hinshoku, file_list in by_hinshoku.items():
         # 製造日（date_folder）の集合
         date_folders = sorted({f["date_folder"] for f in file_list})
+
+        # ファイル数: 元のCSVファイル単位でユニークカウント
+        # （1つのCSVに複数品種混在の場合、その品種に関わるファイルだけ数える）
+        unique_files = {f.get("relpath", f.get("filename")) for f in file_list}
+        file_count = len(unique_files)
 
         total_count = sum(f.get("総件数", 0) for f in file_list)
         total_ok = sum(f.get("OK件数", 0) for f in file_list)
@@ -341,7 +377,7 @@ def aggregate_by_hinshoku(file_index):
         results.append({
             "品種番号": hinshoku,
             "製造日数": len(date_folders),
-            "ファイル数": len(file_list),
+            "ファイル数": file_count,
             "総件数": total_count,
             "OK件数": total_ok,
             "NG件数": total_ng,
