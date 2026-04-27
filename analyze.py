@@ -42,11 +42,12 @@ csv_file_to_process = None
 # =========================
 class LotPreviewDialog(tk.Toplevel):
 
-    def __init__(self, parent, df):
+    def __init__(self, parent, df, hinshoku_num=None):
         super().__init__(parent)
         self.title("ロット分割プレビュー")
         self.result = None
         self.df = df.copy()
+        self.hinshoku_num = hinshoku_num
         self.resizable(True, True)
         self.grab_set()
 
@@ -69,9 +70,9 @@ class LotPreviewDialog(tk.Toplevel):
         frame_tree = ttk.Frame(self, padding=10)
         frame_tree.pack(fill="both", expand=True)
 
-        cols = ("ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数", "状態")
+        cols = ("品種番号", "ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数", "状態")
         self.tree = ttk.Treeview(frame_tree, columns=cols, show="headings", height=10)
-        col_widths = {"ロット": 70, "開始時刻": 150, "終了時刻": 150,
+        col_widths = {"品種番号": 80, "ロット": 70, "開始時刻": 150, "終了時刻": 150,
                       "総件数": 80, "OKデータ件数": 110, "状態": 110}
         for col in cols:
             self.tree.heading(col, text=col)
@@ -122,6 +123,8 @@ class LotPreviewDialog(tk.Toplevel):
         lot_count = df["ロット"].nunique()
         skip_count = 0
 
+        hinshoku_display = str(self.hinshoku_num) if self.hinshoku_num is not None else "-"
+
         for lot, group in df.groupby("ロット"):
             start = group["日付時刻"].min()
             end = group["日付時刻"].max()
@@ -137,6 +140,7 @@ class LotPreviewDialog(tk.Toplevel):
                 tags = ()
 
             self.tree.insert("", "end", tags=tags, values=(
+                hinshoku_display,
                 f"ロット{lot}",
                 start.strftime("%Y-%m-%d %H:%M") if pd.notna(start) else "-",
                 end.strftime("%Y-%m-%d %H:%M") if pd.notna(end) else "-",
@@ -224,13 +228,19 @@ def normalize_columns(file):
                     errors="coerce"
                 )
 
+        hinshoku_num = None
+        if "品種" in df.columns:
+            vals = pd.to_numeric(df["品種"], errors="coerce").dropna()
+            if len(vals) > 0:
+                hinshoku_num = int(vals.iloc[0])
+
         df["メーカー"] = "アンリツ"
         df = df[["測定値出力No.", "日付時刻", "測定値(g)", "ランクコード", "メーカー"]].copy()
         df["測定値出力No."] = pd.to_numeric(df["測定値出力No."], errors="coerce")
         df["測定値(g)"] = pd.to_numeric(df["測定値(g)"], errors="coerce")
         df["ランクコード"] = df["ランクコード"].astype(str).str.strip()
         df["日付時刻"] = pd.to_datetime(df["日付時刻"], errors="coerce")
-        return df
+        return df, hinshoku_num
 
     # ===== イシダ判定 =====
     df_ishida = _read_csv(file, skiprows=10)
@@ -246,6 +256,16 @@ def normalize_columns(file):
             f"ファイル: {os.path.basename(file)}"
         )
 
+    hinshoku_num = None
+    if "予約番号" in df_ishida.columns:
+        vals = pd.to_numeric(df_ishida["予約番号"], errors="coerce").dropna()
+        if len(vals) > 0:
+            hinshoku_num = int(vals.iloc[0])
+    elif len(df_ishida.columns) >= 4:
+        vals = pd.to_numeric(df_ishida.iloc[:, 3], errors="coerce").dropna()
+        if len(vals) > 0:
+            hinshoku_num = int(vals.iloc[0])
+
     df_ishida = df_ishida.iloc[:, [0, 1, 4, 5]].copy()
     df_ishida.columns = ["日付", "時刻", "測定値(g)", "判定"]
 
@@ -258,7 +278,7 @@ def normalize_columns(file):
     df_ishida["ランクコード"] = df_ishida["判定"].map(rank_map)
     df_ishida["メーカー"] = "イシダ"
 
-    return df_ishida[["測定値出力No.", "日付時刻", "測定値(g)", "ランクコード", "メーカー"]]
+    return df_ishida[["測定値出力No.", "日付時刻", "測定値(g)", "ランクコード", "メーカー"]], hinshoku_num
 
 
 # =========================
@@ -291,7 +311,8 @@ def analyze(data):
 # ■ Excel出力
 # =========================
 def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
-                  outliers_df, img_hist, img_series, rank_counts, filename, lot):
+                  outliers_df, img_hist, img_series, rank_counts, filename, lot,
+                  total_count=0, original_ok_count=0, hinshoku_num=None, date_str=None):
 
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.drawing.image import Image
@@ -306,14 +327,22 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
         top=Side(style="thin"), bottom=Side(style="thin")
     )
 
+    ng_count = total_count - original_ok_count
+    defect_rate = (ng_count / total_count * 100) if total_count > 0 else 0.0
+
     result_df = pd.DataFrame({
-        "項目": ["平均", "標準偏差", "データ数", "Max", "Min", "下限(-3σ)", "上限(+3σ)"],
-        "値": [mean, std, len(df_ok), max1, min1, lower, upper]
+        "項目": ["全数", "OK数", "NG数", "不良率(%)", "平均", "標準偏差", "データ数", "Max", "Min", "下限(-3σ)", "上限(+3σ)"],
+        "値": [total_count, original_ok_count, ng_count, defect_rate, mean, std, len(df_ok), max1, min1, lower, upper]
     })
+
+    if hinshoku_num is not None and date_str:
+        title_str = f"{date_str}製造 品種番号{hinshoku_num} 統計結果"
+    else:
+        title_str = None
 
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
 
-        result_df.to_excel(writer, sheet_name="統計結果", index=False)
+        result_df.to_excel(writer, sheet_name="統計結果", index=False, startrow=1 if title_str else 0)
         df_ok[["測定値出力No.", "日付時刻", "測定値(g)"]].to_excel(writer, sheet_name="OKデータ", index=False)
         outliers_df[["測定値出力No.", "日付時刻", "測定値(g)"]].to_excel(writer, sheet_name="外れ値", index=False)
         rank_counts.to_excel(writer, sheet_name="ランクコード集計", index=False)
@@ -324,12 +353,24 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
         ws_result = wb["統計結果"]
         ws_result.column_dimensions["A"].width = 20
         ws_result.column_dimensions["B"].width = 20
-        for cell in ws_result[1]:
+
+        if title_str:
+            ws_result["A1"] = title_str
+            ws_result["A1"].font = Font(bold=True, size=12)
+            ws_result["A1"].alignment = center_align
+            ws_result.merge_cells("A1:B1")
+            header_row = 2
+            data_start_row = 3
+        else:
+            header_row = 1
+            data_start_row = 2
+
+        for cell in ws_result[header_row]:
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = center_align
             cell.border = border
-        for row in ws_result.iter_rows(min_row=2, max_row=ws_result.max_row):
+        for row in ws_result.iter_rows(min_row=data_start_row, max_row=ws_result.max_row):
             for cell in row:
                 cell.fill = result_fill
                 cell.border = border
@@ -338,8 +379,10 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                     item = ws_result.cell(row=cell.row, column=1).value
                     if item == "標準偏差":
                         cell.number_format = "0.000"
-                    elif item == "データ数":
+                    elif item in ("データ数", "全数", "OK数", "NG数"):
                         cell.number_format = "0"
+                    elif item == "不良率(%)":
+                        cell.number_format = "0.00"
                     else:
                         cell.number_format = "0.0"
 
@@ -412,7 +455,7 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
 # =========================
 # ■ ロット処理
 # =========================
-def process_lot(group, lot, save_dir):
+def process_lot(group, lot, save_dir, hinshoku_num=None):
     """
     1ロット分の分析を行いExcelを出力する。
     戻り値:
@@ -426,6 +469,9 @@ def process_lot(group, lot, save_dir):
     rank_counts.columns = ["ランクコード", "件数"]
     rank_counts["内容"] = rank_counts["ランクコード"].map(rank_map)
     rank_counts = rank_counts[["ランクコード", "内容", "件数"]]
+
+    total_count = len(group)
+    original_ok_count = int((group["ランクコード"] == "2").sum())
 
     df_ok = group[group["ランクコード"] == "2"].copy()
 
@@ -441,13 +487,23 @@ def process_lot(group, lot, save_dir):
 
     outliers_df = df_ok[(df_ok["測定値(g)"] < lower) | (df_ok["測定値(g)"] > upper)]
 
+    lot_date = group["日付時刻"].dropna().min()
+    if pd.notna(lot_date) and hinshoku_num is not None:
+        date_str = f"{lot_date.year}/{lot_date.month}/{lot_date.day}"
+        chart_prefix = f"{date_str}製造 品種番号{hinshoku_num} "
+        date_str_safe = date_str.replace("/", "-")
+    else:
+        date_str = None
+        chart_prefix = ""
+        date_str_safe = None
+
     # ===== ヒストグラム =====
     fig1, ax1 = plt.subplots(figsize=(10, 6))
     ax1.hist(data, bins=30, edgecolor="black", alpha=0.7)
     ax1.axvline(mean, color="red", linestyle="-", linewidth=2, label=f"平均: {mean:.2f}")
     ax1.axvline(lower, color="orange", linestyle="--", linewidth=2, label=f"下限(-3σ): {lower:.2f}")
     ax1.axvline(upper, color="orange", linestyle="--", linewidth=2, label=f"上限(+3σ): {upper:.2f}")
-    ax1.set_title(f"ロット{lot} 測定値の分布（n={len(data)}）", fontsize=14, fontweight="bold")
+    ax1.set_title(f"{chart_prefix}測定値の分布（n={len(data)}）", fontsize=14, fontweight="bold")
     ax1.set_xlabel("測定値(g)", fontsize=12)
     ax1.set_ylabel("頻度", fontsize=12)
     ax1.legend(fontsize=10)
@@ -493,7 +549,7 @@ def process_lot(group, lot, save_dir):
     ax2.axhline(upper, color="orange", linewidth=1.5, linestyle="--", label=f"+3σ: {upper:.2f}")
     ax2.axhline(lower, color="orange", linewidth=1.5, linestyle="--", label=f"-3σ: {lower:.2f}")
 
-    ax2.set_title(f"ロット{lot} 時系列チャート（n={len(df_ok)}）", fontsize=14, fontweight="bold")
+    ax2.set_title(f"{chart_prefix}時系列チャート（n={len(df_ok)}）", fontsize=14, fontweight="bold")
     ax2.set_ylabel("測定値(g)", fontsize=12)
     ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.3)
@@ -504,14 +560,22 @@ def process_lot(group, lot, save_dir):
     img_series.seek(0)
     plt.close(fig2)
 
-    filename = os.path.join(
-        save_dir,
-        f"分析結果_ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
-    )
+    if date_str_safe and hinshoku_num is not None:
+        filename = os.path.join(
+            save_dir,
+            f"分析結果_{date_str_safe}製造_品種番号{hinshoku_num} ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
+        )
+    else:
+        filename = os.path.join(
+            save_dir,
+            f"分析結果_ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
+        )
 
     save_to_excel(df_ok, mean, std, ci, max1, min1,
                   lower, upper, outliers_df,
-                  img_hist, img_series, rank_counts, filename, lot)
+                  img_hist, img_series, rank_counts, filename, lot,
+                  total_count=total_count, original_ok_count=original_ok_count,
+                  hinshoku_num=hinshoku_num, date_str=date_str)
 
     return ("ok", len(data))
 
@@ -526,9 +590,9 @@ def process_file(file):
             return
 
         save_dir = os.path.dirname(file)
-        df = normalize_columns(file)
+        df, hinshoku_num = normalize_columns(file)
 
-        dialog = LotPreviewDialog(app_root, df)
+        dialog = LotPreviewDialog(app_root, df, hinshoku_num)
         app_root.wait_window(dialog)
 
         if dialog.result is None or dialog.result[0] == "cancel":
@@ -545,7 +609,7 @@ def process_file(file):
 
         for lot, group in df.groupby("ロット"):
             total = len(group)
-            status, ok_count = process_lot(group, lot, save_dir)
+            status, ok_count = process_lot(group, lot, save_dir, hinshoku_num)
             if status == "ok":
                 created_lots.append((lot, ok_count))
             else:
