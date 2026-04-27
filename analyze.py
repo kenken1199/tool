@@ -856,6 +856,13 @@ if __name__ == "__main__":
     btn = tk.Button(app_root, text="CSV選択して解析", command=run, height=2, width=30)
     btn.pack(pady=20)
 
+    app_root.update_idletasks()
+    w = app_root.winfo_width()
+    h = app_root.winfo_height()
+    sw = app_root.winfo_screenwidth()
+    sh = app_root.winfo_screenheight()
+    app_root.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+
     if len(sys.argv) > 1:
         csv_file_to_process = sys.argv[1]
         app_root.after(500, lambda: process_file(csv_file_to_process))
