@@ -45,6 +45,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from csv_normalizer import normalize_columns
+from detail_dialog import HinshokuDetailDialog
 
 
 # =========================
@@ -446,6 +447,9 @@ class RecordAnalyzerApp:
         ttk.Label(search_bar, textvariable=self.summary_var,
                   foreground="navy").pack(side="left", padx=20)
 
+        ttk.Label(search_bar, text="💡 行をダブルクリックで詳細表示",
+                  foreground="gray").pack(side="right")
+
         # Treeview
         tree_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         tree_frame.pack(fill="both", expand=True)
@@ -470,6 +474,10 @@ class RecordAnalyzerApp:
 
         self.tree.tag_configure("warn", background="#FFF2CC")
         self.tree.tag_configure("error", background="#FFE4E1")
+
+        # ダブルクリック / Enter で詳細画面を開く
+        self.tree.bind("<Double-1>", self._on_row_activate)
+        self.tree.bind("<Return>", self._on_row_activate)
 
         sb_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         sb_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
@@ -643,6 +651,50 @@ class RecordAnalyzerApp:
         if col in key_map:
             self.aggregates.sort(key=key_map[col], reverse=not ascending)
             self._refresh_tree()
+
+    # -------------------------
+    # 詳細画面起動
+    # -------------------------
+    def _on_row_activate(self, event=None):
+        """Treeview行のダブルクリック/Enter押下で詳細画面を開く"""
+        selected = self.tree.selection()
+        if not selected:
+            return
+        item_id = selected[0]
+        values = self.tree.item(item_id, "values")
+        if not values:
+            return
+
+        # 1列目が品種番号文字列。"(不明)"はスキップ
+        hinshoku_str = str(values[0])
+        if hinshoku_str == "(不明)":
+            messagebox.showinfo(
+                "情報",
+                "品種番号が不明な行は詳細表示できません。",
+                parent=self.root,
+            )
+            return
+
+        try:
+            hinshoku_num = int(hinshoku_str)
+        except ValueError:
+            return
+
+        # aggregateから対応する品種を探す
+        agg = next(
+            (a for a in self.aggregates if a["品種番号"] == hinshoku_num),
+            None,
+        )
+        if agg is None:
+            messagebox.showerror(
+                "エラー",
+                f"品種番号 {hinshoku_num} のデータが見つかりません",
+                parent=self.root,
+            )
+            return
+
+        # 詳細画面を開く（モードレス）
+        HinshokuDetailDialog(self.root, self.record_dir, agg)
 
 
 # =========================
