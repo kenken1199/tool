@@ -493,15 +493,18 @@ class RecordAnalyzerApp:
             "推奨下限(g)": 85, "推奨上限(g)": 85, "最終製造日": 95,
         }
 
+        col_labels = {
+            "推奨下限(g)": "下限 −3σ (g)",
+            "推奨上限(g)": "上限 +3σ (g)",
+        }
         for col in cols:
-            self.tree.heading(col, text=col,
+            self.tree.heading(col, text=col_labels.get(col, col),
                               command=lambda c=col: self._sort_by(c))
             anchor = "center" if col in ("品種番号", "製造日数", "最終製造日") else "e"
             if col == "製品名":
                 anchor = "w"
             self.tree.column(col, anchor=anchor, width=col_widths[col])
 
-        self.tree.tag_configure("warn", background="#FFF2CC")
         self.tree.tag_configure("error", background="#FFE4E1")
 
         # ダブルクリック / Enter で詳細画面を開く
@@ -639,8 +642,6 @@ class RecordAnalyzerApp:
             tags = ()
             if hinshoku < 0:
                 tags = ("error",)
-            elif agg["不良率(%)"] > 1.0:
-                tags = ("warn",)
 
             self.tree.insert("", "end", tags=tags, values=(
                 hinshoku if hinshoku >= 0 else "(不明)",
