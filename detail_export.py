@@ -155,7 +155,7 @@ def _make_daily_trend(daily_df, title_prefix):
 
 
 def export_hinshoku_detail(filepath, hinshoku_num, aggregate_info,
-                            combined_df, daily_df, overall_stats):
+                            combined_df, daily_df, overall_stats, product_name=""):
     """
     品種別詳細の全部入りExcelを出力する。
 
@@ -166,6 +166,7 @@ def export_hinshoku_detail(filepath, hinshoku_num, aggregate_info,
         combined_df: 全期間の結合データ（load_hinshoku_dataの結果）
         daily_df: 日別集計（aggregate_by_date_folderの結果）
         overall_stats: compute_overall_statsの結果
+        product_name: 製品名（空文字の場合は品種番号で表示）
     """
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.drawing.image import Image
@@ -179,7 +180,8 @@ def export_hinshoku_detail(filepath, hinshoku_num, aggregate_info,
     upper = overall_stats["推奨上限"]
     n = overall_stats["件数"]
 
-    title_prefix = f"品種番号{hinshoku_num} "
+    display_name = product_name if product_name else f"品種番号{hinshoku_num}"
+    title_prefix = f"{display_name} "
 
     # チャート画像生成
     ok_data = pd.to_numeric(
@@ -209,6 +211,10 @@ def export_hinshoku_detail(filepath, hinshoku_num, aggregate_info,
         # ===== 統計結果シート =====
         stats_rows = [
             ("品種番号", hinshoku_num),
+        ]
+        if product_name:
+            stats_rows.append(("製品名", product_name))
+        stats_rows += [
             ("初回製造日", aggregate_info.get("初回製造日") or "-"),
             ("最終製造日", aggregate_info.get("最終製造日") or "-"),
             ("製造日数", aggregate_info.get("製造日数", 0)),

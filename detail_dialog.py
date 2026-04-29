@@ -14,6 +14,7 @@
 """
 
 import os
+import sys
 import threading
 import queue
 import datetime
@@ -35,20 +36,22 @@ from detail_loader import (
     compute_overall_stats,
 )
 from detail_export import export_hinshoku_detail
+from analyze import LotPreviewDialog, process_lot, MIN_OK_COUNT
 
 
 class HinshokuDetailDialog(tk.Toplevel):
-    def __init__(self, parent, record_dir, aggregate_info):
+    def __init__(self, parent, record_dir, aggregate_info, product_name=""):
         super().__init__(parent)
         self.record_dir = record_dir
         self.aggregate_info = aggregate_info
         self.hinshoku_num = aggregate_info["品種番号"]
+        self.product_name = product_name
 
         self.combined_df = None
         self.daily_df = None
         self.overall_stats = None
 
-        self.title(f"品種詳細 - 品種番号 {self.hinshoku_num}")
+        self.title(f"品種詳細 - {self.display_name}")
         self.geometry("1100x720")
         self.resizable(True, True)
 
@@ -62,6 +65,10 @@ class HinshokuDetailDialog(tk.Toplevel):
         # 起動と同時にデータ読込開始
         self.after(100, self._start_load_data)
 
+    @property
+    def display_name(self):
+        return self.product_name if self.product_name else f"品種番号{self.hinshoku_num}"
+
     # ------------------------------
     # UI構築
     # ------------------------------
@@ -72,7 +79,7 @@ class HinshokuDetailDialog(tk.Toplevel):
 
         agg = self.aggregate_info
         info_text = (
-            f"品種番号: {self.hinshoku_num}   "
+            f"{self.display_name}   "
             f"製造期間: {agg.get('初回製造日', '-')} 〜 {agg.get('最終製造日', '-')}   "
             f"製造日数: {agg.get('製造日数', 0)}日   "
             f"ファイル数: {agg.get('ファイル数', 0)}   "
@@ -263,7 +270,7 @@ class HinshokuDetailDialog(tk.Toplevel):
                    label=f"-3σ: {s['推奨下限']:.3f}")
         ax.axvline(s["推奨上限"], color="orange", linestyle="--", linewidth=2,
                    label=f"+3σ: {s['推奨上限']:.3f}")
-        ax.set_title(f"品種番号{self.hinshoku_num} 全期間ヒストグラム(n={s['件数']:,})",
+        ax.set_title(f"{self.display_name} 全期間ヒストグラム(n={s['件数']:,})",
                      fontsize=11, fontweight="bold")
         ax.set_xlabel("測定値(g)")
         ax.set_ylabel("頻度")
@@ -306,16 +313,17 @@ class HinshokuDetailDialog(tk.Toplevel):
         ax1.axhline(overall_mean, color="red", linestyle="--", alpha=0.5,
                     label=f"全期間平均: {overall_mean:.3f}")
 
-        # 異常日をハイライト
-        abnormal = valid[valid["異常フラグ"] == True]
-        if len(abnormal) > 0:
-            ax1.scatter(abnormal["日付dt"], abnormal["平均(g)"],
+        # 平均の異常日をハイライト
+        reason_col = valid["異常理由"] if "異常理由" in valid.columns else pd.Series("", index=valid.index)
+        mean_abnormal = valid[reason_col.str.contains("平均", na=False)]
+        if len(mean_abnormal) > 0:
+            ax1.scatter(mean_abnormal["日付dt"], mean_abnormal["平均(g)"],
                         color="red", s=80, zorder=5,
                         marker="o", facecolors="none", edgecolors="red", linewidth=2,
-                        label=f"異常日({len(abnormal)}日)")
+                        label=f"平均異常({len(mean_abnormal)}日)")
 
         ax1.set_ylabel("平均(g)", fontsize=10)
-        ax1.set_title(f"品種番号{self.hinshoku_num} 日別推移",
+        ax1.set_title(f"{self.display_name} 日別推移",
                       fontsize=12, fontweight="bold")
         ax1.legend(fontsize=8)
         ax1.grid(True, alpha=0.3)
@@ -325,6 +333,17 @@ class HinshokuDetailDialog(tk.Toplevel):
         valid_std = valid.dropna(subset=["σ(g)"])
         ax2.plot(valid_std["日付dt"], valid_std["σ(g)"],
                  marker="s", color="darkorange", linewidth=1.5, markersize=5)
+
+        # σの異常日をハイライト
+        reason_col_std = valid_std["異常理由"] if "異常理由" in valid_std.columns else pd.Series("", index=valid_std.index)
+        sigma_abnormal = valid_std[reason_col_std.str.contains("σ.*大", na=False)]
+        if len(sigma_abnormal) > 0:
+            ax2.scatter(sigma_abnormal["日付dt"], sigma_abnormal["σ(g)"],
+                        color="red", s=80, zorder=5,
+                        marker="o", facecolors="none", edgecolors="red", linewidth=2,
+                        label=f"σ異常({len(sigma_abnormal)}日)")
+            ax2.legend(fontsize=8)
+
         ax2.set_ylabel("σ(g)", fontsize=10)
         ax2.grid(True, alpha=0.3)
         plt.setp(ax2.xaxis.get_majorticklabels(), visible=False)
@@ -358,12 +377,17 @@ class HinshokuDetailDialog(tk.Toplevel):
             ttk.Label(self.tab_daily, text="日別データがありません").pack(expand=True)
             return
 
+        hint_bar = ttk.Frame(self.tab_daily, padding=(10, 5, 10, 0))
+        hint_bar.pack(fill="x")
+        ttk.Label(hint_bar, text="💡 行をダブルクリックするとロット分割・分析Excelを作成できます",
+                  foreground="gray").pack(side="right")
+
         frame = ttk.Frame(self.tab_daily, padding=10)
         frame.pack(fill="both", expand=True)
 
         cols = ("日付", "ファイル数", "総件数", "OK件数", "NG件数",
                 "不良率(%)", "平均(g)", "σ(g)", "Min(g)", "Max(g)", "備考")
-        tree = ttk.Treeview(frame, columns=cols, show="headings", height=18)
+        self._daily_tree = ttk.Treeview(frame, columns=cols, show="headings", height=18)
 
         widths = {
             "日付": 90, "ファイル数": 70, "総件数": 75, "OK件数": 75, "NG件数": 70,
@@ -371,13 +395,13 @@ class HinshokuDetailDialog(tk.Toplevel):
             "備考": 250,
         }
         for col in cols:
-            tree.heading(col, text=col)
+            self._daily_tree.heading(col, text=col)
             anchor = "center" if col in ("日付", "ファイル数") else "e"
             if col == "備考":
                 anchor = "w"
-            tree.column(col, anchor=anchor, width=widths[col])
+            self._daily_tree.column(col, anchor=anchor, width=widths[col])
 
-        tree.tag_configure("abnormal", background="#FFE4E1")
+        self._daily_tree.tag_configure("abnormal", background="#FFE4E1")
 
         for _, row in self.daily_df.iterrows():
             tags = ("abnormal",) if row.get("異常フラグ") else ()
@@ -385,7 +409,7 @@ class HinshokuDetailDialog(tk.Toplevel):
             std_v = row["σ(g)"]
             min_v = row["Min(g)"]
             max_v = row["Max(g)"]
-            tree.insert("", "end", tags=tags, values=(
+            self._daily_tree.insert("", "end", tags=tags, values=(
                 row["日付"],
                 row["ファイル数"],
                 f"{row['総件数']:,}",
@@ -399,10 +423,87 @@ class HinshokuDetailDialog(tk.Toplevel):
                 row.get("異常理由", ""),
             ))
 
-        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=sb.set)
-        tree.pack(side="left", fill="both", expand=True)
+        self._daily_tree.bind("<Double-1>", self._on_analyze_day_activate)
+        self._daily_tree.bind("<Return>", self._on_analyze_day_activate)
+
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self._daily_tree.yview)
+        self._daily_tree.configure(yscrollcommand=sb.set)
+        self._daily_tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
+
+    def _on_analyze_day_activate(self, event=None):
+        if not hasattr(self, "_daily_tree"):
+            return
+        selected = self._daily_tree.selection()
+        if not selected:
+            return
+        values = self._daily_tree.item(selected[0], "values")
+        if not values:
+            return
+        self._analyze_day(str(values[0]))
+
+    def _analyze_day(self, date_folder):
+        if self.combined_df is None or len(self.combined_df) == 0:
+            messagebox.showwarning("データなし", "データが読込中です", parent=self)
+            return
+
+        try:
+            target_date = pd.to_datetime(date_folder, format="%Y%m%d").date()
+        except Exception:
+            messagebox.showerror("エラー", f"日付の解析に失敗しました: {date_folder}", parent=self)
+            return
+
+        day_df = self.combined_df[
+            self.combined_df["日付時刻"].dt.date == target_date
+        ].copy()
+
+        if len(day_df) == 0:
+            messagebox.showwarning("データなし", f"{date_folder} のデータが見つかりません", parent=self)
+            return
+
+        dialog = LotPreviewDialog(self, day_df, self.hinshoku_num, product_name=self.product_name)
+        self.wait_window(dialog)
+
+        if dialog.result is None or dialog.result[0] == "cancel":
+            return
+        if dialog.result[0] == "manual":
+            messagebox.showwarning("中止", "CSVを手動分割してください", parent=self)
+            return
+
+        df_lots = dialog.result[1]
+
+        save_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+        created_lots = []
+        skipped_lots = []
+        for lot, group in df_lots.groupby("ロット"):
+            total = len(group)
+            status, ok_count = process_lot(group, lot, save_dir, self.hinshoku_num, product_name=self.product_name)
+            if status == "ok":
+                created_lots.append((lot, ok_count))
+            else:
+                skipped_lots.append((lot, ok_count, total))
+
+        if not created_lots and skipped_lots:
+            msg = "Excelファイルは作成されませんでした。\n\n"
+            msg += "すべてのロットでOKデータが不足しています:\n"
+            for lot, ok, total in skipped_lots:
+                msg += f"  ・ロット{lot}: 総{total}件 / OK{ok}件\n"
+            msg += "\nしきい値を変更するか、CSVの内容をご確認ください。"
+            messagebox.showerror("作成失敗", msg, parent=self)
+        elif skipped_lots:
+            msg = f"Excel作成完了\n作成: {len(created_lots)}ファイル\n\n"
+            msg += "⚠ 以下のロットはOKデータ不足のためスキップしました:\n"
+            for lot, ok, total in skipped_lots:
+                msg += f"  ・ロット{lot}: 総{total}件 / OK{ok}件\n"
+            msg += f"\n（OKデータが {MIN_OK_COUNT} 件未満のロットは統計計算ができません）"
+            messagebox.showwarning("完了（一部スキップ）", msg, parent=self)
+        else:
+            messagebox.showinfo(
+                "完了",
+                f"Excel作成完了\n{len(created_lots)}ファイルを作成しました。",
+                parent=self,
+            )
 
     # ------------------------------
     # タブ4: エクスポート
@@ -413,7 +514,7 @@ class HinshokuDetailDialog(tk.Toplevel):
 
         ttk.Label(
             frame,
-            text=f"品種番号 {self.hinshoku_num} の詳細レポートをExcelに出力します。",
+            text=f"{self.display_name} の詳細レポートをExcelに出力します。",
             font=("", 11),
         ).pack(anchor="w", pady=(0, 10))
 
@@ -454,8 +555,9 @@ class HinshokuDetailDialog(tk.Toplevel):
                                    parent=self)
             return
 
+        safe_name = self.display_name.replace("/", "-").replace("\\", "-")
         default_name = (
-            f"品種詳細_品種番号{self.hinshoku_num}_"
+            f"品種詳細_{safe_name}_"
             f"{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
         )
         filepath = filedialog.asksaveasfilename(
@@ -479,6 +581,7 @@ class HinshokuDetailDialog(tk.Toplevel):
                 combined_df=self.combined_df,
                 daily_df=self.daily_df,
                 overall_stats=self.overall_stats,
+                product_name=self.product_name,
             )
 
             self.export_status_var.set(f"✓ 出力完了: {os.path.basename(filepath)}")

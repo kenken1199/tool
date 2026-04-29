@@ -53,6 +53,32 @@ from detail_dialog import HinshokuDetailDialog
 # =========================
 CACHE_FILENAME = "record_cache.json"
 CACHE_VERSION = 2  # v2: ファイル内複数品種に対応（品種ごとに分割保存）
+PRODUCT_NAMES_FILENAME = "product_names.csv"
+
+
+# =========================
+# ■ 製品名マスタ読込
+# =========================
+def load_product_names(record_dir):
+    """
+    record_dir 直下の product_names.csv を読込み、品種番号→製品名の辞書を返す。
+    ファイルが存在しない場合は空辞書を返す。
+
+    CSV形式（ヘッダ行必須）:
+        品種番号,製品名
+        1,チョコクッキー
+        2,バニラウエハース
+    """
+    path = os.path.join(record_dir, PRODUCT_NAMES_FILENAME)
+    if not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_csv(path, dtype={"品種番号": str, "製品名": str})
+        df["品種番号"] = pd.to_numeric(df["品種番号"], errors="coerce").dropna().astype(int)
+        df = df.dropna(subset=["品種番号", "製品名"])
+        return dict(zip(df["品種番号"].astype(int), df["製品名"].str.strip()))
+    except Exception:
+        return {}
 DATE_FOLDER_PATTERN = re.compile(r"^\d{8}$")  # 例: 20250219
 INDIV_PATTERN = re.compile(r"^INDIV(_\d+)?\.csv$", re.IGNORECASE)
 
@@ -412,6 +438,7 @@ class RecordAnalyzerApp:
         self.record_dir = None
         self.file_index = {}      # relpath -> info
         self.aggregates = []      # aggregate_by_hinshokuの結果
+        self.product_names = {}   # 品種番号 -> 製品名
         self.scan_queue = None
         self.cancel_event = None
 
@@ -438,7 +465,7 @@ class RecordAnalyzerApp:
         # 検索バー
         search_bar = ttk.Frame(self.root, padding=(10, 0, 10, 5))
         search_bar.pack(fill="x")
-        ttk.Label(search_bar, text="🔍 品種番号で絞込:").pack(side="left")
+        ttk.Label(search_bar, text="🔍 品種番号/製品名で絞込:").pack(side="left")
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self._refresh_tree())
         ttk.Entry(search_bar, textvariable=self.search_var, width=15).pack(side="left", padx=5)
@@ -454,13 +481,13 @@ class RecordAnalyzerApp:
         tree_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         tree_frame.pack(fill="both", expand=True)
 
-        cols = ("品種番号", "製造日数", "総件数", "OK件数", "不良率(%)",
+        cols = ("品種番号", "製品名", "製造日数", "総件数", "OK件数", "不良率(%)",
                 "平均(g)", "σ(g)", "Min(g)", "Max(g)",
                 "推奨下限(g)", "推奨上限(g)", "最終製造日")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=20)
 
         col_widths = {
-            "品種番号": 75, "製造日数": 65, "総件数": 75, "OK件数": 75,
+            "品種番号": 75, "製品名": 150, "製造日数": 65, "総件数": 75, "OK件数": 75,
             "不良率(%)": 70, "平均(g)": 75, "σ(g)": 70,
             "Min(g)": 70, "Max(g)": 70,
             "推奨下限(g)": 85, "推奨上限(g)": 85, "最終製造日": 95,
@@ -470,6 +497,8 @@ class RecordAnalyzerApp:
             self.tree.heading(col, text=col,
                               command=lambda c=col: self._sort_by(c))
             anchor = "center" if col in ("品種番号", "製造日数", "最終製造日") else "e"
+            if col == "製品名":
+                anchor = "w"
             self.tree.column(col, anchor=anchor, width=col_widths[col])
 
         self.tree.tag_configure("warn", background="#FFF2CC")
@@ -568,6 +597,7 @@ class RecordAnalyzerApp:
         errors = result["errors"]
 
         self.aggregates = aggregate_by_hinshoku(self.file_index)
+        self.product_names = load_product_names(self.record_dir)
         self._refresh_tree()
 
         n_hinshoku = len(self.aggregates)
@@ -602,7 +632,8 @@ class RecordAnalyzerApp:
 
         for agg in self.aggregates:
             hinshoku = agg["品種番号"]
-            if keyword and keyword not in str(hinshoku):
+            product_name = self.product_names.get(hinshoku, "")
+            if keyword and keyword not in str(hinshoku) and keyword not in product_name:
                 continue
 
             tags = ()
@@ -613,6 +644,7 @@ class RecordAnalyzerApp:
 
             self.tree.insert("", "end", tags=tags, values=(
                 hinshoku if hinshoku >= 0 else "(不明)",
+                product_name,
                 agg["製造日数"],
                 f"{agg['総件数']:,}",
                 f"{agg['OK件数']:,}",
@@ -636,6 +668,7 @@ class RecordAnalyzerApp:
 
         key_map = {
             "品種番号":   lambda r: r["品種番号"],
+            "製品名":     lambda r: self.product_names.get(r["品種番号"], ""),
             "製造日数":   lambda r: r["製造日数"],
             "総件数":     lambda r: r["総件数"],
             "OK件数":     lambda r: r["OK件数"],
@@ -693,8 +726,10 @@ class RecordAnalyzerApp:
             )
             return
 
+        product_name = self.product_names.get(hinshoku_num, "")
+
         # 詳細画面を開く（モードレス）
-        HinshokuDetailDialog(self.root, self.record_dir, agg)
+        HinshokuDetailDialog(self.root, self.record_dir, agg, product_name=product_name)
 
 
 # =========================

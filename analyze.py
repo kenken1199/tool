@@ -42,12 +42,13 @@ csv_file_to_process = None
 # =========================
 class LotPreviewDialog(tk.Toplevel):
 
-    def __init__(self, parent, df, hinshoku_num=None):
+    def __init__(self, parent, df, hinshoku_num=None, product_name=""):
         super().__init__(parent)
         self.title("ロット分割プレビュー")
         self.result = None
         self.df = df.copy()
         self.hinshoku_num = hinshoku_num
+        self.product_name = product_name
         self.resizable(True, True)
         self.grab_set()
 
@@ -70,9 +71,10 @@ class LotPreviewDialog(tk.Toplevel):
         frame_tree = ttk.Frame(self, padding=10)
         frame_tree.pack(fill="both", expand=True)
 
-        cols = ("品種番号", "ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数", "状態")
+        first_col = "製品名" if product_name else "品種番号"
+        cols = (first_col, "ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数", "状態")
         self.tree = ttk.Treeview(frame_tree, columns=cols, show="headings", height=10)
-        col_widths = {"品種番号": 80, "ロット": 70, "開始時刻": 150, "終了時刻": 150,
+        col_widths = {first_col: 110, "ロット": 70, "開始時刻": 150, "終了時刻": 150,
                       "総件数": 80, "OKデータ件数": 110, "状態": 110}
         for col in cols:
             self.tree.heading(col, text=col)
@@ -123,7 +125,12 @@ class LotPreviewDialog(tk.Toplevel):
         lot_count = df["ロット"].nunique()
         skip_count = 0
 
-        hinshoku_display = str(self.hinshoku_num) if self.hinshoku_num is not None else "-"
+        if self.product_name:
+            hinshoku_display = self.product_name
+        elif self.hinshoku_num is not None:
+            hinshoku_display = str(self.hinshoku_num)
+        else:
+            hinshoku_display = "-"
 
         for lot, group in df.groupby("ロット"):
             start = group["日付時刻"].min()
@@ -312,7 +319,8 @@ def analyze(data):
 # =========================
 def _create_report_sheet(wb, df_ok, mean, std, ci, max1, min1, lower, upper,
                           outliers_df, img_hist_bytes, img_series_bytes, rank_counts,
-                          total_count, original_ok_count, hinshoku_num, date_str, lot):
+                          total_count, original_ok_count, hinshoku_num, date_str, lot,
+                          product_name=""):
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.drawing.image import Image
 
@@ -346,8 +354,9 @@ def _create_report_sheet(wb, df_ok, mean, std, ci, max1, min1, lower, upper,
     defect_rate = (ng_count / total_count * 100) if total_count > 0 else 0.0
 
     # タイトル行
-    if hinshoku_num is not None and date_str:
-        title = f"{date_str}製造   品種番号 {hinshoku_num}   ロット{lot}   分析レポート"
+    display_label = product_name if product_name else (f"品種番号 {hinshoku_num}" if hinshoku_num is not None else None)
+    if display_label and date_str:
+        title = f"{date_str}製造   {display_label}   ロット{lot}   分析レポート"
     else:
         title = f"ロット{lot}   分析レポート"
 
@@ -490,7 +499,8 @@ def _create_report_sheet(wb, df_ok, mean, std, ci, max1, min1, lower, upper,
 
 def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                   outliers_df, img_hist, img_series, rank_counts, filename, lot,
-                  total_count=0, original_ok_count=0, hinshoku_num=None, date_str=None):
+                  total_count=0, original_ok_count=0, hinshoku_num=None, date_str=None,
+                  product_name=""):
 
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.drawing.image import Image
@@ -514,8 +524,9 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                ci[0] if ci[0] is not None else None, ci[1] if ci[1] is not None else None]
     })
 
-    if hinshoku_num is not None and date_str:
-        title_str = f"{date_str}製造 品種番号{hinshoku_num} 統計結果"
+    display_label = product_name if product_name else (f"品種番号{hinshoku_num}" if hinshoku_num is not None else None)
+    if display_label and date_str:
+        title_str = f"{date_str}製造 {display_label} 統計結果"
     else:
         title_str = None
 
@@ -637,14 +648,15 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
         _create_report_sheet(
             wb, df_ok, mean, std, ci, max1, min1, lower, upper,
             outliers_df, img_hist_bytes, img_series_bytes, rank_counts,
-            total_count, original_ok_count, hinshoku_num, date_str, lot
+            total_count, original_ok_count, hinshoku_num, date_str, lot,
+            product_name=product_name,
         )
 
 
 # =========================
 # ■ ロット処理
 # =========================
-def process_lot(group, lot, save_dir, hinshoku_num=None):
+def process_lot(group, lot, save_dir, hinshoku_num=None, product_name=""):
     """
     1ロット分の分析を行いExcelを出力する。
     戻り値:
@@ -677,9 +689,10 @@ def process_lot(group, lot, save_dir, hinshoku_num=None):
     outliers_df = df_ok[(df_ok["測定値(g)"] < lower) | (df_ok["測定値(g)"] > upper)]
 
     lot_date = group["日付時刻"].dropna().min()
-    if pd.notna(lot_date) and hinshoku_num is not None:
+    display_label = product_name if product_name else (f"品種番号{hinshoku_num}" if hinshoku_num is not None else None)
+    if pd.notna(lot_date) and display_label:
         date_str = f"{lot_date.year}/{lot_date.month}/{lot_date.day}"
-        chart_prefix = f"{date_str}製造 品種番号{hinshoku_num} "
+        chart_prefix = f"{date_str}製造 {display_label} "
         date_str_safe = date_str.replace("/", "-")
     else:
         date_str = None
@@ -749,10 +762,11 @@ def process_lot(group, lot, save_dir, hinshoku_num=None):
     img_series.seek(0)
     plt.close(fig2)
 
-    if date_str_safe and hinshoku_num is not None:
+    if date_str_safe and display_label:
+        safe_label = display_label.replace("/", "-").replace("\\", "-")
         filename = os.path.join(
             save_dir,
-            f"分析結果_{date_str_safe}製造_品種番号{hinshoku_num} ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
+            f"分析結果_{date_str_safe}製造_{safe_label} ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
         )
     else:
         filename = os.path.join(
@@ -764,7 +778,8 @@ def process_lot(group, lot, save_dir, hinshoku_num=None):
                   lower, upper, outliers_df,
                   img_hist, img_series, rank_counts, filename, lot,
                   total_count=total_count, original_ok_count=original_ok_count,
-                  hinshoku_num=hinshoku_num, date_str=date_str)
+                  hinshoku_num=hinshoku_num, date_str=date_str,
+                  product_name=product_name)
 
     return ("ok", len(data))
 
