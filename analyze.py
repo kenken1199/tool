@@ -5,8 +5,12 @@ import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 import numpy as np
 from scipy import stats
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    _TKINTER_AVAILABLE = True
+except ImportError:
+    _TKINTER_AVAILABLE = False
 import datetime
 from io import BytesIO
 import os

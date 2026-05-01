@@ -1,26 +1,15 @@
-altgraph==0.17.5
-contourpy==1.3.3
-cycler==0.12.1
-et_xmlfile==2.0.0
-fonttools==4.62.1
-kiwisolver==1.5.0
-matplotlib==3.10.8
 numpy==2.4.4
-openpyxl==3.1.5
-packaging==26.1
 pandas==3.0.2
-pefile==2024.8.26
-pillow==12.2.0
-pyinstaller==6.19.0
-pyinstaller-hooks-contrib==2026.4
-pyparsing==3.3.2
-python-dateutil==2.9.0.post0
-pywin32-ctypes==0.2.3
 scipy==1.17.1
-setuptools==82.0.1
-six==1.17.0
+matplotlib==3.10.8
+openpyxl==3.1.5
+pillow==12.2.0
+python-dateutil==2.9.0.post0
 tzdata==2026.1
 
-# Web app (Streamlit)
+# Web app
 streamlit==1.57.0
 plotly==6.7.0
+
+# Japanese font support on Linux
+japanize-matplotlib

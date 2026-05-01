@@ -41,11 +41,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    from detail_dialog import HinshokuDetailDialog
+    _TKINTER_AVAILABLE = True
+except ImportError:
+    _TKINTER_AVAILABLE = False
 
 from csv_normalizer import normalize_columns
-from detail_dialog import HinshokuDetailDialog
 
 
 # =========================

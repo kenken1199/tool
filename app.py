@@ -1,12 +1,24 @@
 """
-RECORD フォルダ集計ツール - Streamlit Web版
+RECORD フォルダ集計ツール - Streamlit Web版（ファイルアップロード対応）
 """
 
 import os
 import io
+import re
 import json
+import zipfile
+import tempfile
+import shutil
 import datetime
 import traceback
+
+import matplotlib
+matplotlib.use("Agg")
+
+try:
+    import japanize_matplotlib  # Linux上での日本語フォント対応
+except ImportError:
+    pass
 
 import numpy as np
 import pandas as pd
@@ -49,6 +61,7 @@ st.set_page_config(
 def _init_state():
     defaults = {
         "record_dir": "",
+        "temp_dir": None,
         "file_index": {},
         "aggregates": [],
         "product_names": {},
@@ -58,16 +71,39 @@ def _init_state():
         "daily_df": None,
         "overall_stats": None,
         "detail_errors": [],
-        # フォルダブラウザ
-        "show_browser": False,
-        "browse_path": "",
-        "browse_filter": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 _init_state()
+
+
+# ─────────────────────────────────────────────────────────────
+# ZIPからRECORDルートを探す
+# ─────────────────────────────────────────────────────────────
+_DATE_PAT = re.compile(r"^\d{8}$")
+
+def _find_record_root(base_dir: str) -> str:
+    """展開したZIP内でYYYYMMDDフォルダを持つディレクトリを返す"""
+    def _has_date_folders(path):
+        try:
+            return any(
+                _DATE_PAT.match(e) and os.path.isdir(os.path.join(path, e))
+                for e in os.listdir(path)
+            )
+        except OSError:
+            return False
+
+    if _has_date_folders(base_dir):
+        return base_dir
+
+    for sub in sorted(os.listdir(base_dir)):
+        subpath = os.path.join(base_dir, sub)
+        if os.path.isdir(subpath) and _has_date_folders(subpath):
+            return subpath
+
+    return base_dir
 
 
 # ─────────────────────────────────────────────────────────────
@@ -88,7 +124,8 @@ def run_scan(record_dir: str):
     files = find_indiv_csvs(record_dir)
     total = len(files)
     if total == 0:
-        st.error("INDIV.csv が見つかりません。RECORDフォルダの構造を確認してください。")
+        st.error("INDIV.csv が見つかりません。ZIPのフォルダ構造を確認してください。\n\n"
+                 "期待する構造:\n```\nRECORD/\n├── 20250219/\n│   └── INDIV.csv\n└── 20250220/\n    └── INDIV.csv\n```")
         return
 
     new_cache = {}
@@ -198,22 +235,23 @@ def _lot_excel_bytes(
     product_name: str,
 ) -> bytes | None:
     import platform
-    import matplotlib
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     import matplotlib.font_manager as fm
 
-    candidates = {
-        "Windows": ["MS Gothic", "Yu Gothic", "Meiryo"],
-        "Darwin": ["Hiragino Sans", "Hiragino Maru Gothic Pro"],
-        "Linux": ["Noto Sans CJK JP", "IPAGothic"],
-    }.get(platform.system(), [])
-    available = {f.name for f in fm.fontManager.ttflist}
-    for font in candidates:
-        if font in available:
-            plt.rcParams["font.family"] = font
-            break
+    try:
+        import japanize_matplotlib  # noqa: F401
+    except ImportError:
+        candidates = {
+            "Windows": ["MS Gothic", "Yu Gothic", "Meiryo"],
+            "Darwin": ["Hiragino Sans", "Hiragino Maru Gothic Pro"],
+            "Linux": ["Noto Sans CJK JP", "IPAGothic"],
+        }.get(platform.system(), [])
+        available = {f.name for f in fm.fontManager.ttflist}
+        for font in candidates:
+            if font in available:
+                plt.rcParams["font.family"] = font
+                break
 
     rank_map = {"2": "OK", "1": "軽量", "E": "過量", "0": "２個乗り"}
     rank_counts = lot_group["ランクコード"].value_counts().reset_index()
@@ -312,149 +350,79 @@ def _lot_excel_bytes(
 
 
 # ─────────────────────────────────────────────────────────────
-# フォルダブラウザ（サイドバー用）
-# ─────────────────────────────────────────────────────────────
-def _list_dirs(path: str, filter_str: str) -> list[str]:
-    """path 直下のディレクトリ一覧を返す（アクセス不可は空リスト）"""
-    try:
-        entries = [
-            e.path for e in os.scandir(path)
-            if e.is_dir() and not e.name.startswith(".")
-        ]
-        entries.sort(key=lambda p: os.path.basename(p).lower())
-        if filter_str:
-            entries = [p for p in entries if filter_str.lower() in os.path.basename(p).lower()]
-        return entries
-    except (PermissionError, OSError):
-        return []
-
-
-def _windows_drives() -> list[str]:
-    import string
-    return [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
-
-
-def render_folder_browser():
-    """サイドバー内フォルダブラウザを描画する"""
-    current = st.session_state.browse_path
-
-    # ── 現在地の表示 ──
-    st.caption("現在地:")
-    st.code(current or "(ドライブ一覧)", language=None)
-
-    # ── ナビゲーション ──
-    col_up, col_home = st.columns(2)
-    with col_up:
-        parent = os.path.dirname(current) if current else ""
-        at_root = (not current) or (parent == current)
-        if st.button("↑ 上へ", disabled=at_root, use_container_width=True, key="fb_up"):
-            # Windows: ドライブルート（例 C:\）の上はドライブ一覧へ
-            if os.path.splitdrive(current)[1] in ("\\", "/", ""):
-                st.session_state.browse_path = ""
-            else:
-                st.session_state.browse_path = parent
-            st.session_state.browse_filter = ""
-            st.rerun()
-    with col_home:
-        if st.button("🏠 ホーム", use_container_width=True, key="fb_home"):
-            st.session_state.browse_path = os.path.expanduser("~")
-            st.session_state.browse_filter = ""
-            st.rerun()
-
-    # ── フィルタ ──
-    filter_str = st.text_input(
-        "絞込", value=st.session_state.browse_filter,
-        placeholder="フォルダ名で絞込...", key="fb_filter_input", label_visibility="collapsed",
-    )
-    if filter_str != st.session_state.browse_filter:
-        st.session_state.browse_filter = filter_str
-        st.rerun()
-
-    # ── ディレクトリ一覧 ──
-    if not current:
-        # Windows: ドライブ一覧
-        entries = _windows_drives()
-    else:
-        entries = _list_dirs(current, filter_str)
-
-    if not entries:
-        st.caption("サブフォルダなし")
-    else:
-        for path in entries[:60]:
-            name = os.path.basename(path) or path  # ドライブは basename が空
-            if st.button(f"📁 {name}", key=f"fb_{path}", use_container_width=True):
-                st.session_state.browse_path = path
-                st.session_state.browse_filter = ""
-                st.rerun()
-        if len(entries) > 60:
-            st.caption(f"…他 {len(entries)-60} 件（絞込で絞ってください）")
-
-    st.divider()
-
-    # ── 選択ボタン ──
-    if current and os.path.isdir(current):
-        if st.button(
-            f"✓ このフォルダを選択",
-            type="primary", use_container_width=True, key="fb_select",
-        ):
-            st.session_state.record_dir = current
-            st.session_state.show_browser = False
-            st.session_state.browse_filter = ""
-            st.rerun()
-    else:
-        st.button("✓ このフォルダを選択", disabled=True, use_container_width=True, key="fb_select_dis")
-
-
-# ─────────────────────────────────────────────────────────────
 # サイドバー
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚖️ RECORD 集計ツール")
     st.divider()
 
-    # 選択中フォルダの表示
-    selected = st.session_state.record_dir
-    if selected:
-        st.success(f"**選択中:**\n{selected}")
-    else:
-        st.info("フォルダが未選択です")
+    uploaded_zip = st.file_uploader(
+        "📁 RECORDフォルダ（ZIP）",
+        type=["zip"],
+        help=(
+            "RECORDフォルダをZIP圧縮してアップロードしてください。\n\n"
+            "期待する構造:\n"
+            "RECORD/\n"
+            "├── 20250219/\n"
+            "│   └── INDIV.csv\n"
+            "└── 20250220/\n"
+            "    └── INDIV.csv"
+        ),
+    )
 
-    # フォルダ選択ボタン
-    browser_label = "📂 フォルダを閉じる" if st.session_state.show_browser else "📁 フォルダを選択..."
-    if st.button(browser_label, use_container_width=True):
-        st.session_state.show_browser = not st.session_state.show_browser
-        if st.session_state.show_browser and not st.session_state.browse_path:
-            # 初回: 現在選択中フォルダ or Cドライブ or ホーム
-            st.session_state.browse_path = (
-                selected or
-                (r"C:\\" if os.path.exists(r"C:\\") else os.path.expanduser("~"))
-            )
-        st.rerun()
+    uploaded_pnames = st.file_uploader(
+        "📋 製品名マスタ CSV（任意）",
+        type=["csv"],
+        help="品種番号,製品名 形式のCSV（ヘッダ行あり）",
+    )
 
-    # フォルダブラウザ（展開時）
-    if st.session_state.show_browser:
-        st.divider()
-        render_folder_browser()
-        st.divider()
+    st.divider()
 
-    # スキャンボタン
     col1, col2 = st.columns(2)
     with col1:
         scan_btn = st.button(
-            "🔍 スキャン", use_container_width=True, type="primary",
-            disabled=not st.session_state.record_dir,
+            "🔍 スキャン",
+            use_container_width=True,
+            type="primary",
+            disabled=uploaded_zip is None,
         )
     with col2:
         rescan_btn = st.button(
-            "🔄 再スキャン", use_container_width=True,
+            "🔄 再スキャン",
+            use_container_width=True,
             disabled=not st.session_state.record_dir,
         )
 
-    if scan_btn and st.session_state.record_dir:
+    if scan_btn and uploaded_zip:
+        # 古い一時フォルダを削除
+        old_tmp = st.session_state.get("temp_dir")
+        if old_tmp and os.path.exists(old_tmp):
+            shutil.rmtree(old_tmp, ignore_errors=True)
+
+        # ZIPを一時フォルダに展開
+        tmp = tempfile.mkdtemp()
+        try:
+            with zipfile.ZipFile(io.BytesIO(uploaded_zip.read())) as zf:
+                zf.extractall(tmp)
+        except zipfile.BadZipFile:
+            st.error("ZIPファイルの読み込みに失敗しました。正しいZIPファイルを選択してください。")
+            shutil.rmtree(tmp, ignore_errors=True)
+            st.stop()
+
+        record_dir = _find_record_root(tmp)
+
+        # 製品名CSVを保存
+        if uploaded_pnames:
+            pnames_bytes = uploaded_pnames.read()
+            pnames_path = os.path.join(record_dir, "product_names.csv")
+            with open(pnames_path, "wb") as f:
+                f.write(pnames_bytes)
+
+        st.session_state.temp_dir = tmp
+        st.session_state.record_dir = record_dir
         st.session_state.view = "list"
         st.session_state.selected_hinshoku = None
-        st.session_state.show_browser = False
-        run_scan(st.session_state.record_dir)
+        run_scan(record_dir)
         st.rerun()
 
     if rescan_btn and st.session_state.record_dir:
@@ -484,7 +452,7 @@ if st.session_state.view == "list":
     st.header("品種別集計一覧")
 
     if not st.session_state.aggregates:
-        st.info("左のサイドバーで RECORD フォルダパスを入力して「スキャン」してください。")
+        st.info("左のサイドバーから RECORD フォルダを ZIP でアップロードして「スキャン」してください。")
         st.stop()
 
     search = st.text_input("🔍 品種番号・製品名で絞込", placeholder="例: 12 またはチョコ")
