@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/k-nakamori/Desktop/**)",
+      "Bash(\"C:\\\\Users\\\\k-nakamori\\\\tool\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import app\")"
+    ]
+  }
+}

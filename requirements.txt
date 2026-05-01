@@ -20,3 +20,7 @@ scipy==1.17.1
 setuptools==82.0.1
 six==1.17.0
 tzdata==2026.1
+
+# Web app (Streamlit)
+streamlit==1.57.0
+plotly==6.7.0
