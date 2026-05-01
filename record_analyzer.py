@@ -47,7 +47,21 @@ try:
     from detail_dialog import HinshokuDetailDialog
     _TKINTER_AVAILABLE = True
 except ImportError:
+    import types
     _TKINTER_AVAILABLE = False
+    _stub = object
+    tk = types.SimpleNamespace(
+        Tk=_stub, Toplevel=_stub, Frame=_stub,
+        StringVar=_stub, IntVar=_stub,
+    )
+    ttk = types.SimpleNamespace(
+        Frame=_stub, Button=_stub, Label=_stub, Entry=_stub,
+        Treeview=_stub, Scrollbar=_stub, Progressbar=_stub,
+        Spinbox=_stub, Notebook=_stub,
+    )
+    messagebox = None
+    filedialog = None
+    HinshokuDetailDialog = None
 
 from csv_normalizer import normalize_columns
 

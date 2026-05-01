@@ -10,7 +10,13 @@ try:
     from tkinter import ttk, filedialog, messagebox
     _TKINTER_AVAILABLE = True
 except ImportError:
+    import types
     _TKINTER_AVAILABLE = False
+    _stub = object
+    tk = types.SimpleNamespace(Tk=_stub, Toplevel=_stub, Frame=_stub, StringVar=_stub, IntVar=_stub)
+    ttk = types.SimpleNamespace(Frame=_stub, Button=_stub, Label=_stub, Entry=_stub, Treeview=_stub, Scrollbar=_stub, Spinbox=_stub, Notebook=_stub)
+    messagebox = None
+    filedialog = None
 import datetime
 from io import BytesIO
 import os
