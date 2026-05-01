@@ -42,12 +42,13 @@ csv_file_to_process = None
 # =========================
 class LotPreviewDialog(tk.Toplevel):
 
-    def __init__(self, parent, df, hinshoku_num=None):
+    def __init__(self, parent, df, hinshoku_num=None, product_name=""):
         super().__init__(parent)
         self.title("ロット分割プレビュー")
         self.result = None
         self.df = df.copy()
         self.hinshoku_num = hinshoku_num
+        self.product_name = product_name
         self.resizable(True, True)
         self.grab_set()
 
@@ -70,9 +71,10 @@ class LotPreviewDialog(tk.Toplevel):
         frame_tree = ttk.Frame(self, padding=10)
         frame_tree.pack(fill="both", expand=True)
 
-        cols = ("品種番号", "ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数", "状態")
+        first_col = "製品名" if product_name else "品種番号"
+        cols = (first_col, "ロット", "開始時刻", "終了時刻", "総件数", "OKデータ件数", "状態")
         self.tree = ttk.Treeview(frame_tree, columns=cols, show="headings", height=10)
-        col_widths = {"品種番号": 80, "ロット": 70, "開始時刻": 150, "終了時刻": 150,
+        col_widths = {first_col: 110, "ロット": 70, "開始時刻": 150, "終了時刻": 150,
                       "総件数": 80, "OKデータ件数": 110, "状態": 110}
         for col in cols:
             self.tree.heading(col, text=col)
@@ -85,6 +87,10 @@ class LotPreviewDialog(tk.Toplevel):
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", self._on_lot_double_click)
+
+        ttk.Label(self, text="💡 行をダブルクリックするとロット詳細を確認できます",
+                  foreground="gray", font=("", 9), padding=(10, 2)).pack(fill="x")
 
         # --- 注意書きラベル ---
         self.warn_label_var = tk.StringVar()
@@ -123,7 +129,12 @@ class LotPreviewDialog(tk.Toplevel):
         lot_count = df["ロット"].nunique()
         skip_count = 0
 
-        hinshoku_display = str(self.hinshoku_num) if self.hinshoku_num is not None else "-"
+        if self.product_name:
+            hinshoku_display = self.product_name
+        elif self.hinshoku_num is not None:
+            hinshoku_display = str(self.hinshoku_num)
+        else:
+            hinshoku_display = "-"
 
         for lot, group in df.groupby("ロット"):
             start = group["日付時刻"].min()
@@ -181,6 +192,421 @@ class LotPreviewDialog(tk.Toplevel):
     def _on_cancel(self):
         self.result = ("cancel", None)
         self.destroy()
+
+    def _on_lot_double_click(self, event=None):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        values = self.tree.item(selected[0], "values")
+        if not values:
+            return
+        try:
+            lot_num = int(str(values[1]).replace("ロット", ""))
+        except (ValueError, AttributeError):
+            return
+        if not hasattr(self, "_df_with_lots"):
+            return
+        lot_df = self._df_with_lots[self._df_with_lots["ロット"] == lot_num].copy()
+        if len(lot_df) == 0:
+            return
+        LotDetailDialog(self, lot_df, lot_num, self.hinshoku_num, self.product_name)
+
+
+# =========================
+# ■ ロット詳細ダイアログ
+# =========================
+class LotDetailDialog(tk.Toplevel):
+
+    def __init__(self, parent, df_lot, lot_num, hinshoku_num=None, product_name=""):
+        super().__init__(parent)
+        self.lot_num = lot_num
+        self.hinshoku_num = hinshoku_num
+        self.product_name = product_name
+        self._df_lot = df_lot.copy()
+
+        display = product_name if product_name else (
+            f"品種番号{hinshoku_num}" if hinshoku_num is not None else "")
+        self.title(f"ロット{lot_num} 詳細  {display}")
+        self.geometry("1000x680")
+        self.resizable(True, True)
+
+        stats = self._compute_stats()
+        if stats is None:
+            ttk.Label(
+                self,
+                text=f"OKデータが {MIN_OK_COUNT} 件未満のため統計計算できません",
+                font=("", 12), foreground="#9C0006",
+            ).pack(expand=True)
+            return
+
+        (self.df_ok, self.mean, self.std, self.ci,
+         self.max1, self.min1, self.lower, self.upper,
+         self.outliers_df, self.rank_counts,
+         self.total_count, self.original_ok_count) = stats
+
+        self._build_ui()
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + 40
+        y = parent.winfo_rooty() + 40
+        self.geometry(f"+{x}+{y}")
+
+    def _compute_stats(self):
+        group = self._df_lot
+        rank_map = {"2": "OK", "1": "軽量", "E": "過量", "0": "２個乗り"}
+        rank_counts = group["ランクコード"].value_counts().reset_index()
+        rank_counts.columns = ["ランクコード", "件数"]
+        rank_counts["内容"] = rank_counts["ランクコード"].map(rank_map)
+        rank_counts = rank_counts[["ランクコード", "内容", "件数"]]
+
+        total_count = len(group)
+        original_ok_count = int((group["ランクコード"] == "2").sum())
+
+        df_ok = group[group["ランクコード"] == "2"].copy()
+        data = pd.to_numeric(df_ok["測定値(g)"], errors="coerce")
+        df_ok = df_ok.loc[data.notna()].copy()
+        data = data.loc[data.notna()]
+        data_arr = np.asarray(data).ravel()
+
+        if len(data_arr) < MIN_OK_COUNT:
+            return None
+
+        mean, std, ci, max1, min1, lower, upper = analyze(data_arr)
+        outliers_df = df_ok[(df_ok["測定値(g)"] < lower) | (df_ok["測定値(g)"] > upper)]
+        return (df_ok, mean, std, ci, max1, min1, lower, upper,
+                outliers_df, rank_counts, total_count, original_ok_count)
+
+    def _build_ui(self):
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tab_sum = ttk.Frame(nb)
+        tab_ts  = ttk.Frame(nb)
+        tab_ok  = ttk.Frame(nb)
+        tab_out = ttk.Frame(nb)
+        tab_exp = ttk.Frame(nb)
+
+        nb.add(tab_sum, text="📊 サマリー")
+        nb.add(tab_ts,  text="📈 時系列チャート")
+        nb.add(tab_ok,  text="✅ OKデータ")
+        nb.add(tab_out, text="⚠ 外れ値")
+        nb.add(tab_exp, text="💾 エクスポート")
+
+        self._build_summary_tab(tab_sum, Figure, FigureCanvasTkAgg)
+        self._build_series_tab(tab_ts, Figure, FigureCanvasTkAgg, NavigationToolbar2Tk)
+        self._build_ok_tab(tab_ok)
+        self._build_outlier_tab(tab_out)
+        self._build_export_tab(tab_exp)
+
+    # ------ タブ1: サマリー ------
+    def _build_summary_tab(self, parent, Figure, FigureCanvasTkAgg):
+        left = ttk.Frame(parent, padding=10)
+        left.pack(side="left", fill="y")
+
+        ttk.Label(left, text="■ 統計値", font=("", 10, "bold")).pack(anchor="w", pady=(0, 5))
+
+        tree = ttk.Treeview(left, columns=("値",), show="tree headings", height=16)
+        tree.column("#0", width=160, anchor="w")
+        tree.column("値", width=120, anchor="e")
+        tree.heading("#0", text="項目")
+        tree.heading("値", text="値")
+
+        ng = self.total_count - self.original_ok_count
+        dr = (ng / self.total_count * 100) if self.total_count > 0 else 0.0
+        rows = [
+            ("全数",          f"{self.total_count:,}"),
+            ("OK数",          f"{self.original_ok_count:,}"),
+            ("NG数",          f"{ng:,}"),
+            ("不良率(%)",      f"{dr:.3f}"),
+            ("",              ""),
+            ("平均(g)",        f"{self.mean:.4f}"),
+            ("標準偏差(g)",    f"{self.std:.5f}"),
+            ("OKデータ件数",   f"{len(self.df_ok):,}"),
+            ("Max(g)",        f"{self.max1:.3f}"),
+            ("Min(g)",        f"{self.min1:.3f}"),
+            ("下限 −3σ(g)",   f"{self.lower:.4f}"),
+            ("上限 +3σ(g)",   f"{self.upper:.4f}"),
+            ("",              ""),
+            ("95%CI 下限(g)", f"{self.ci[0]:.4f}" if self.ci[0] is not None else "-"),
+            ("95%CI 上限(g)", f"{self.ci[1]:.4f}" if self.ci[1] is not None else "-"),
+            ("外れ値件数",     f"{len(self.outliers_df):,}"),
+        ]
+        for label, val in rows:
+            tree.insert("", "end", text=label, values=(val,))
+        tree.pack(fill="y")
+
+        right = ttk.Frame(parent, padding=10)
+        right.pack(side="right", fill="both", expand=True)
+
+        data = pd.to_numeric(self.df_ok["測定値(g)"], errors="coerce").dropna()
+        fig = Figure(figsize=(7, 5), dpi=90)
+        ax = fig.add_subplot(111)
+        ax.hist(data, bins=30, edgecolor="black", alpha=0.7, color="steelblue")
+        ax.axvline(self.mean,  color="red",    linestyle="-",  linewidth=2, label=f"平均: {self.mean:.3f}")
+        ax.axvline(self.lower, color="orange", linestyle="--", linewidth=2, label=f"-3σ: {self.lower:.3f}")
+        ax.axvline(self.upper, color="orange", linestyle="--", linewidth=2, label=f"+3σ: {self.upper:.3f}")
+        ax.set_title(f"ロット{self.lot_num} ヒストグラム (n={len(data):,})", fontsize=11, fontweight="bold")
+        ax.set_xlabel("測定値(g)")
+        ax.set_ylabel("頻度")
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=right)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.draw()
+
+    # ------ タブ2: 時系列チャート ------
+    def _build_series_tab(self, parent, Figure, FigureCanvasTkAgg, NavigationToolbar2Tk):
+        df_ok = self.df_ok
+        outlier_mask = (df_ok["測定値(g)"] < self.lower) | (df_ok["測定値(g)"] > self.upper)
+        y_vals = df_ok["測定値(g)"].values
+        has_datetime = df_ok["日付時刻"].notna().any()
+
+        fig = Figure(figsize=(11, 5), dpi=90)
+        ax = fig.add_subplot(111)
+
+        if has_datetime:
+            x_all = df_ok["日付時刻"]
+            x_ok  = df_ok.loc[~outlier_mask, "日付時刻"]
+            x_out = df_ok.loc[outlier_mask,  "日付時刻"]
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            fig.autofmt_xdate(rotation=30)
+            ax.set_xlabel("時刻", fontsize=12)
+        else:
+            x_all = np.arange(1, len(df_ok) + 1)
+            x_ok  = x_all[~outlier_mask.values]
+            x_out = x_all[outlier_mask.values]
+            ax.set_xlabel("測定順序", fontsize=12)
+
+        y_ok  = y_vals[~outlier_mask.values]
+        y_out = y_vals[outlier_mask.values]
+
+        ax.plot(x_all, y_vals, color="steelblue", linewidth=0.6, alpha=0.4, zorder=1)
+        ax.scatter(x_ok, y_ok, color="steelblue", s=18, alpha=0.8, zorder=2, label="OK")
+        if len(x_out) > 0:
+            ax.scatter(x_out, y_out, color="red", s=50, marker="x",
+                       linewidths=2, zorder=3, label=f"外れ値 ({len(x_out)}件)")
+        ax.axhline(self.mean,  color="red",    linewidth=1.5, linestyle="-",  label=f"平均: {self.mean:.2f}")
+        ax.axhline(self.upper, color="orange", linewidth=1.5, linestyle="--", label=f"+3σ: {self.upper:.2f}")
+        ax.axhline(self.lower, color="orange", linewidth=1.5, linestyle="--", label=f"-3σ: {self.lower:.2f}")
+        ax.set_title(f"ロット{self.lot_num} 時系列チャート (n={len(df_ok):,})", fontsize=12, fontweight="bold")
+        ax.set_ylabel("測定値(g)", fontsize=12)
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=5)
+        canvas.draw()
+
+        tb_frame = ttk.Frame(parent)
+        tb_frame.pack(fill="x", padx=10)
+        NavigationToolbar2Tk(canvas, tb_frame)
+
+    # ------ タブ3: OKデータ ------
+    def _build_ok_tab(self, parent):
+        outlier_nos = set(self.outliers_df["測定値出力No."].values)
+        frame = ttk.Frame(parent, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="※ 赤色行が外れ値（±3σ超）です",
+                  foreground="#9C0006").pack(anchor="w", pady=(0, 5))
+
+        cols = ("測定値出力No.", "日付時刻", "測定値(g)")
+        tree = ttk.Treeview(frame, columns=cols, show="headings")
+        tree.tag_configure("outlier", background="#FFCCCC", foreground="#9C0006")
+        tree.column("測定値出力No.", anchor="center", width=130)
+        tree.column("日付時刻",     anchor="center", width=170)
+        tree.column("測定値(g)",    anchor="e",      width=100)
+        for col in cols:
+            tree.heading(col, text=col)
+
+        for _, row in self.df_ok.iterrows():
+            dt  = row["日付時刻"]
+            val = row["測定値(g)"]
+            dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(dt) else "-"
+            is_out = row["測定値出力No."] in outlier_nos
+            tree.insert("", "end",
+                        tags=("outlier",) if is_out else (),
+                        values=(row["測定値出力No."], dt_str,
+                                f"{val:.3f}" if pd.notna(val) else "-"))
+
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+    # ------ タブ4: 外れ値 ------
+    def _build_outlier_tab(self, parent):
+        frame = ttk.Frame(parent, padding=10)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text=f"外れ値: {len(self.outliers_df):,}件（±3σ超）",
+                  font=("", 10, "bold")).pack(anchor="w", pady=(0, 5))
+
+        cols = ("測定値出力No.", "日付時刻", "測定値(g)")
+        tree = ttk.Treeview(frame, columns=cols, show="headings")
+        tree.column("測定値出力No.", anchor="center", width=130)
+        tree.column("日付時刻",     anchor="center", width=170)
+        tree.column("測定値(g)",    anchor="e",      width=100)
+        for col in cols:
+            tree.heading(col, text=col)
+
+        for _, row in self.outliers_df.iterrows():
+            dt  = row["日付時刻"]
+            val = row["測定値(g)"]
+            dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(dt) else "-"
+            tree.insert("", "end", values=(
+                row["測定値出力No."], dt_str,
+                f"{val:.3f}" if pd.notna(val) else "-",
+            ))
+
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+    # ------ タブ5: エクスポート ------
+    def _build_export_tab(self, parent):
+        frame = ttk.Frame(parent, padding=20)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text=f"ロット{self.lot_num} の分析結果をExcelに出力します。",
+                  font=("", 11)).pack(anchor="w", pady=(0, 10))
+        ttk.Label(frame, text=(
+            "出力内容:\n"
+            "  ・分析レポート（統計値 + グラフ）\n"
+            "  ・OKデータ（外れ値は赤色）\n"
+            "  ・外れ値\n"
+            "  ・ランクコード集計"
+        ), justify="left").pack(anchor="w", pady=(0, 20))
+
+        ttk.Button(frame, text="📤 Excelに出力する",
+                   command=self._on_export).pack(anchor="w")
+
+        self._export_status_var = tk.StringVar()
+        ttk.Label(frame, textvariable=self._export_status_var,
+                  foreground="navy").pack(anchor="w", pady=(10, 0))
+
+    def _on_export(self):
+        lot_date = self._df_lot["日付時刻"].dropna().min()
+        display_label = (self.product_name if self.product_name
+                         else (f"品種番号{self.hinshoku_num}" if self.hinshoku_num is not None else None))
+
+        if pd.notna(lot_date) and display_label:
+            date_str = f"{lot_date.year}/{lot_date.month}/{lot_date.day}"
+            chart_prefix = f"{date_str}製造 {display_label} "
+            date_str_safe = date_str.replace("/", "-")
+            safe_label = display_label.replace("/", "-").replace("\\", "-")
+            default_name = (f"分析結果_{date_str_safe}製造_{safe_label} "
+                            f"ロット{self.lot_num}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx")
+        else:
+            date_str = None
+            chart_prefix = ""
+            default_name = f"分析結果_ロット{self.lot_num}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
+
+        filepath = filedialog.asksaveasfilename(
+            parent=self,
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel files", "*.xlsx")],
+        )
+        if not filepath:
+            return
+
+        try:
+            self._export_status_var.set("出力中...")
+            self.update_idletasks()
+
+            data = pd.to_numeric(self.df_ok["測定値(g)"], errors="coerce").dropna()
+
+            # ヒストグラム
+            fig1, ax1 = plt.subplots(figsize=(10, 6))
+            ax1.hist(data, bins=30, edgecolor="black", alpha=0.7)
+            ax1.axvline(self.mean,  color="red",    linestyle="-",  linewidth=2,
+                        label=f"平均: {self.mean:.2f}")
+            ax1.axvline(self.lower, color="orange", linestyle="--", linewidth=2,
+                        label=f"下限(-3σ): {self.lower:.2f}")
+            ax1.axvline(self.upper, color="orange", linestyle="--", linewidth=2,
+                        label=f"上限(+3σ): {self.upper:.2f}")
+            ax1.set_title(f"{chart_prefix}測定値の分布（n={len(data)}）",
+                          fontsize=14, fontweight="bold")
+            ax1.set_xlabel("測定値(g)", fontsize=12)
+            ax1.set_ylabel("頻度", fontsize=12)
+            ax1.legend(fontsize=10)
+            ax1.grid(True, alpha=0.3)
+            fig1.tight_layout()
+            img_hist = BytesIO()
+            fig1.savefig(img_hist, format="png", dpi=100, bbox_inches="tight")
+            img_hist.seek(0)
+            plt.close(fig1)
+
+            # 時系列チャート
+            fig2, ax2 = plt.subplots(figsize=(12, 5))
+            y_vals = self.df_ok["測定値(g)"].values
+            outlier_mask = ((self.df_ok["測定値(g)"] < self.lower) |
+                            (self.df_ok["測定値(g)"] > self.upper))
+            has_dt = self.df_ok["日付時刻"].notna().any()
+
+            if has_dt:
+                x_all = self.df_ok["日付時刻"]
+                x_ok  = self.df_ok.loc[~outlier_mask, "日付時刻"]
+                x_out = self.df_ok.loc[outlier_mask,  "日付時刻"]
+                ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+                ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+                plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right")
+                ax2.set_xlabel("時刻", fontsize=12)
+            else:
+                x_all = np.arange(1, len(self.df_ok) + 1)
+                x_ok  = x_all[~outlier_mask.values]
+                x_out = x_all[outlier_mask.values]
+                ax2.set_xlabel("測定順序", fontsize=12)
+
+            y_ok  = y_vals[~outlier_mask.values]
+            y_out = y_vals[outlier_mask.values]
+            ax2.plot(x_all, y_vals, color="steelblue", linewidth=0.6, alpha=0.4, zorder=1)
+            ax2.scatter(x_ok, y_ok, color="steelblue", s=18, alpha=0.8, zorder=2, label="OK")
+            if len(x_out) > 0:
+                ax2.scatter(x_out, y_out, color="red", s=50, marker="x",
+                            linewidths=2, zorder=3, label=f"外れ値 ({len(x_out)}件)")
+            ax2.axhline(self.mean,  color="red",    linewidth=1.5, linestyle="-",
+                        label=f"平均: {self.mean:.2f}")
+            ax2.axhline(self.upper, color="orange", linewidth=1.5, linestyle="--",
+                        label=f"+3σ: {self.upper:.2f}")
+            ax2.axhline(self.lower, color="orange", linewidth=1.5, linestyle="--",
+                        label=f"-3σ: {self.lower:.2f}")
+            ax2.set_title(f"{chart_prefix}時系列チャート（n={len(self.df_ok)}）",
+                          fontsize=14, fontweight="bold")
+            ax2.set_ylabel("測定値(g)", fontsize=12)
+            ax2.legend(fontsize=10)
+            ax2.grid(True, alpha=0.3)
+            fig2.tight_layout()
+            img_series = BytesIO()
+            fig2.savefig(img_series, format="png", dpi=100, bbox_inches="tight")
+            img_series.seek(0)
+            plt.close(fig2)
+
+            save_to_excel(
+                self.df_ok, self.mean, self.std, self.ci,
+                self.max1, self.min1, self.lower, self.upper,
+                self.outliers_df, img_hist, img_series, self.rank_counts,
+                filepath, self.lot_num,
+                total_count=self.total_count, original_ok_count=self.original_ok_count,
+                hinshoku_num=self.hinshoku_num, date_str=date_str,
+                product_name=self.product_name,
+            )
+            self._export_status_var.set(f"✓ 出力完了: {os.path.basename(filepath)}")
+            messagebox.showinfo("完了", f"Excelファイルを出力しました:\n{filepath}", parent=self)
+        except Exception as e:
+            import traceback
+            self._export_status_var.set("出力失敗")
+            messagebox.showerror(
+                "エラー", f"出力に失敗しました:\n{e}\n\n{traceback.format_exc()}", parent=self)
 
 
 # =========================
@@ -312,7 +738,8 @@ def analyze(data):
 # =========================
 def _create_report_sheet(wb, df_ok, mean, std, ci, max1, min1, lower, upper,
                           outliers_df, img_hist_bytes, img_series_bytes, rank_counts,
-                          total_count, original_ok_count, hinshoku_num, date_str, lot):
+                          total_count, original_ok_count, hinshoku_num, date_str, lot,
+                          product_name=""):
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.drawing.image import Image
 
@@ -346,8 +773,9 @@ def _create_report_sheet(wb, df_ok, mean, std, ci, max1, min1, lower, upper,
     defect_rate = (ng_count / total_count * 100) if total_count > 0 else 0.0
 
     # タイトル行
-    if hinshoku_num is not None and date_str:
-        title = f"{date_str}製造   品種番号 {hinshoku_num}   ロット{lot}   分析レポート"
+    display_label = product_name if product_name else (f"品種番号 {hinshoku_num}" if hinshoku_num is not None else None)
+    if display_label and date_str:
+        title = f"{date_str}製造   {display_label}   ロット{lot}   分析レポート"
     else:
         title = f"ロット{lot}   分析レポート"
 
@@ -490,7 +918,8 @@ def _create_report_sheet(wb, df_ok, mean, std, ci, max1, min1, lower, upper,
 
 def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                   outliers_df, img_hist, img_series, rank_counts, filename, lot,
-                  total_count=0, original_ok_count=0, hinshoku_num=None, date_str=None):
+                  total_count=0, original_ok_count=0, hinshoku_num=None, date_str=None,
+                  product_name=""):
 
     from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
     from openpyxl.drawing.image import Image
@@ -514,8 +943,9 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
                ci[0] if ci[0] is not None else None, ci[1] if ci[1] is not None else None]
     })
 
-    if hinshoku_num is not None and date_str:
-        title_str = f"{date_str}製造 品種番号{hinshoku_num} 統計結果"
+    display_label = product_name if product_name else (f"品種番号{hinshoku_num}" if hinshoku_num is not None else None)
+    if display_label and date_str:
+        title_str = f"{date_str}製造 {display_label} 統計結果"
     else:
         title_str = None
 
@@ -637,14 +1067,15 @@ def save_to_excel(df_ok, mean, std, ci, max1, min1, lower, upper,
         _create_report_sheet(
             wb, df_ok, mean, std, ci, max1, min1, lower, upper,
             outliers_df, img_hist_bytes, img_series_bytes, rank_counts,
-            total_count, original_ok_count, hinshoku_num, date_str, lot
+            total_count, original_ok_count, hinshoku_num, date_str, lot,
+            product_name=product_name,
         )
 
 
 # =========================
 # ■ ロット処理
 # =========================
-def process_lot(group, lot, save_dir, hinshoku_num=None):
+def process_lot(group, lot, save_dir, hinshoku_num=None, product_name=""):
     """
     1ロット分の分析を行いExcelを出力する。
     戻り値:
@@ -677,9 +1108,10 @@ def process_lot(group, lot, save_dir, hinshoku_num=None):
     outliers_df = df_ok[(df_ok["測定値(g)"] < lower) | (df_ok["測定値(g)"] > upper)]
 
     lot_date = group["日付時刻"].dropna().min()
-    if pd.notna(lot_date) and hinshoku_num is not None:
+    display_label = product_name if product_name else (f"品種番号{hinshoku_num}" if hinshoku_num is not None else None)
+    if pd.notna(lot_date) and display_label:
         date_str = f"{lot_date.year}/{lot_date.month}/{lot_date.day}"
-        chart_prefix = f"{date_str}製造 品種番号{hinshoku_num} "
+        chart_prefix = f"{date_str}製造 {display_label} "
         date_str_safe = date_str.replace("/", "-")
     else:
         date_str = None
@@ -749,10 +1181,11 @@ def process_lot(group, lot, save_dir, hinshoku_num=None):
     img_series.seek(0)
     plt.close(fig2)
 
-    if date_str_safe and hinshoku_num is not None:
+    if date_str_safe and display_label:
+        safe_label = display_label.replace("/", "-").replace("\\", "-")
         filename = os.path.join(
             save_dir,
-            f"分析結果_{date_str_safe}製造_品種番号{hinshoku_num} ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
+            f"分析結果_{date_str_safe}製造_{safe_label} ロット{lot}_{datetime.datetime.now():%Y%m%d_%H%M}.xlsx"
         )
     else:
         filename = os.path.join(
@@ -764,7 +1197,8 @@ def process_lot(group, lot, save_dir, hinshoku_num=None):
                   lower, upper, outliers_df,
                   img_hist, img_series, rank_counts, filename, lot,
                   total_count=total_count, original_ok_count=original_ok_count,
-                  hinshoku_num=hinshoku_num, date_str=date_str)
+                  hinshoku_num=hinshoku_num, date_str=date_str,
+                  product_name=product_name)
 
     return ("ok", len(data))
 
